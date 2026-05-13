@@ -1,0 +1,45 @@
+# Python/local environment
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Logs and caches
+*.log
+*.db
+*.sqlite
+*.sqlite3
+.cache/
+
+# Local app/runtime data
+.ambox/
+settings.ini
+profiles.json
+active-config.json
+cache.db
+
+# VPN configs and private connection material
+vless*.txt
+vmess*.txt
+trojan*.txt
+ss*.txt
+*.conf
+*.ovpn
+*.mobileconfig
+
+# Secrets and credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+*secret*
+*token*
