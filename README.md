@@ -67,6 +67,7 @@ Debug режим:
 ~/.ambox/active-config.json # текущий config для sing-box
 ~/.ambox/cache.db           # cache sing-box
 ~/.ambox/app.log            # лог приложения
+~/.ambox/imports/           # локальная папка для ручного импорта конфигов
 ```
 
 ## Как использовать

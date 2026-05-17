@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 from PySide6.QtCore import QObject, QProcess, Signal
 
-from app.app_paths import active_config_path
+from app.app_paths import active_config_path, ensure_user_owned, singbox_cache_path
 from app.config_parser import Profile, RoutingOptions, build_singbox_config
 
 
@@ -288,6 +288,7 @@ class VpnManager(QObject):
 
         cfg = build_singbox_config(profile.outbound, routing)
         self._temp_config.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        ensure_user_owned(self._temp_config)
 
         self._fatal_reported = False
         self._set_status("connecting")
@@ -310,6 +311,7 @@ class VpnManager(QObject):
             self.process.kill()
             self.process.waitForFinished(2000)
         self._set_status("disconnected")
+        ensure_user_owned(singbox_cache_path())
         self.log_line.emit("VPN disconnected")
 
     def _read_stdout(self) -> None:

@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -34,7 +35,7 @@ from PySide6.QtWidgets import (
 
 from app.config_parser import ConfigError, Profile, RoutingOptions, load_profiles, load_profiles_from_text, parse_domains_text
 from app.latency import profile_latency_ms
-from app.app_paths import profiles_path, settings_path
+from app.app_paths import ensure_user_owned, import_configs_dir, profiles_path, settings_path
 from app.vpn_manager import VpnManager
 
 
@@ -64,6 +65,7 @@ class MainWindow(QMainWindow):
 
         self.vpn = VpnManager()
         self.settings = QSettings(str(settings_path()), QSettings.IniFormat)
+        ensure_user_owned(settings_path())
 
         self._build_ui()
         self._build_menu()
@@ -205,6 +207,7 @@ class MainWindow(QMainWindow):
 
         self.profile_list = QListWidget()
         self.profile_list.setObjectName("profiles")
+        self.profile_list.setContextMenuPolicy(Qt.CustomContextMenu)
         profiles_layout.addWidget(self.profile_list, 1)
 
         profile_buttons = QHBoxLayout()
@@ -213,8 +216,11 @@ class MainWindow(QMainWindow):
         import_btn.clicked.connect(self.import_config)
         clip_btn = QPushButton("Paste clipboard")
         clip_btn.clicked.connect(self.import_from_clipboard)
+        delete_btn = QPushButton("Delete")
+        delete_btn.clicked.connect(self.delete_selected_profile)
         profile_buttons.addWidget(import_btn)
         profile_buttons.addWidget(clip_btn)
+        profile_buttons.addWidget(delete_btn)
         profiles_layout.addLayout(profile_buttons)
         self.content_stack.addWidget(profiles_tab)
 
@@ -651,6 +657,8 @@ class MainWindow(QMainWindow):
         if not force and (now - self._last_usage_persist) < 5.0:
             return
         self.settings.setValue("profile_usage_bytes", json.dumps(self._usage_store, ensure_ascii=True))
+        self.settings.sync()
+        ensure_user_owned(settings_path())
         self._usage_dirty = False
         self._last_usage_persist = now
 
@@ -763,6 +771,7 @@ class MainWindow(QMainWindow):
         self.vpn.install_state_changed.connect(self._on_install_state_changed)
         self.latencies_ready.connect(self._on_latencies_ready)
         self.profile_list.currentRowChanged.connect(self._on_profile_list_row_changed)
+        self.profile_list.customContextMenuRequested.connect(self._show_profile_context_menu)
         self.quick_profile_combo.currentIndexChanged.connect(self._on_quick_profile_changed)
         self.auto_switch_checkbox.toggled.connect(lambda checked: self.settings.setValue("auto_switch", checked))
         self.timeout_spin.valueChanged.connect(lambda value: self.settings.setValue("timeout_ms", value))
@@ -853,7 +862,9 @@ class MainWindow(QMainWindow):
             ]
         }
         try:
-            profiles_path().write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            path = profiles_path()
+            path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            ensure_user_owned(path)
         except OSError as exc:
             self._append_log(f"Failed to save profiles: {exc}")
 
@@ -902,7 +913,7 @@ class MainWindow(QMainWindow):
         path_str, _ = QFileDialog.getOpenFileName(
             self,
             "Open config",
-            str(Path.home()),
+            str(import_configs_dir()),
             "Config files (*.json *.txt *.conf);;All files (*)",
         )
         if not path_str:
@@ -950,6 +961,62 @@ class MainWindow(QMainWindow):
 
         self._apply_loaded_profiles(loaded)
         self._append_log(f"Imported {len(loaded)} profile(s) from clipboard")
+
+    def delete_selected_profile(self) -> None:
+        index = self._selected_profile_index()
+        if index is None:
+            self._show_error("Choose a profile to delete")
+            return
+
+        profile = self.profiles[index]
+        if self.connected_index == index:
+            self.vpn.disconnect()
+
+        del self.profiles[index]
+        del self.profile_latencies[index]
+        del self.profile_usage_bytes[index]
+        self._pending_latency_indices = {
+            item - 1 if item > index else item
+            for item in self._pending_latency_indices
+            if item != index
+        }
+
+        if self.connected_index is not None and self.connected_index > index:
+            self.connected_index -= 1
+
+        self.profile_list.takeItem(index)
+        self._usage_store.pop(self._profile_usage_key(profile), None)
+        self._usage_dirty = True
+        self._persist_usage_store(force=True)
+        self._save_profiles()
+
+        if self.profiles:
+            self.profile_list.setCurrentRow(min(index, len(self.profiles) - 1))
+        else:
+            self.profile_list.clearSelection()
+            self._latency_has_results = False
+            self._last_latency_update_text = "never"
+        self._sync_quick_profile_selector()
+        self._refresh_latency_update_labels()
+        self._append_log(f"Deleted profile: {profile.name}")
+
+    def _show_profile_context_menu(self, pos) -> None:
+        item = self.profile_list.itemAt(pos)
+        if item is None:
+            return
+
+        row = self.profile_list.row(item)
+        if row < 0 or row >= len(self.profiles):
+            return
+
+        if self.profile_list.currentRow() != row:
+            self.profile_list.setCurrentRow(row)
+
+        menu = QMenu(self)
+        delete_action = menu.addAction("Delete")
+        selected_action = menu.exec(self.profile_list.viewport().mapToGlobal(pos))
+        if selected_action is delete_action:
+            self.delete_selected_profile()
 
     def _apply_loaded_profiles(self, loaded: list[Profile], persist: bool = True) -> None:
         if not loaded:
@@ -1160,5 +1227,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._persist_usage_store(force=True)
+        self.settings.sync()
+        ensure_user_owned(settings_path())
         self.vpn.disconnect()
         super().closeEvent(event)
