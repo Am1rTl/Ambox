@@ -13,5 +13,5 @@ fi
 . "$ROOT_DIR/.venv/bin/activate"
 mkdir -p "$DIST_DIR"
 
-pyinstaller --noconfirm --clean --onefile --name ambox-linux main.py
+pyinstaller --noconfirm --clean ambox-linux.spec
 echo "Built: $DIST_DIR/ambox-linux"

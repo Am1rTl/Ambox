@@ -1,21 +1,26 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import shutil
 import threading
 import time
+from copy import deepcopy
 from pathlib import Path
 from urllib.parse import unquote
 
-from PySide6.QtCore import QSettings, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import QSettings, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -28,32 +33,90 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QStackedWidget,
+    QSystemTrayIcon,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
+from app.app_paths import ensure_user_owned, import_configs_dir, log_path, profiles_path, settings_path
 from app.config_parser import ConfigError, Profile, RoutingOptions, load_profiles, load_profiles_from_text, parse_domains_text
 from app.latency import profile_latency_ms
-from app.app_paths import ensure_user_owned, import_configs_dir, profiles_path, settings_path
 from app.vpn_manager import VpnManager
 
 
+class ProfileListWidget(QListWidget):
+    files_dropped = Signal(list)
+    items_reordered = Signal(int, int)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._drag_row: int | None = None
+        self.setAcceptDrops(True)
+        self.setDragEnabled(True)
+        self.setDropIndicatorShown(True)
+        self.setDefaultDropAction(Qt.MoveAction)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setSelectionMode(QAbstractItemView.SingleSelection)
+
+    def startDrag(self, supported_actions) -> None:  # type: ignore[override]
+        self._drag_row = self.currentRow()
+        super().startDrag(supported_actions)
+
+    def dragEnterEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:  # type: ignore[override]
+        if event.mimeData().hasUrls():
+            paths = []
+            for url in event.mimeData().urls():
+                if not url.isLocalFile():
+                    continue
+                local_path = url.toLocalFile()
+                if local_path:
+                    paths.append(local_path)
+            if paths:
+                self.files_dropped.emit(paths)
+                event.acceptProposedAction()
+                return
+
+        old_row = self._drag_row
+        super().dropEvent(event)
+        new_row = self.currentRow()
+        if old_row is None or new_row < 0 or old_row == new_row:
+            return
+        self.items_reordered.emit(old_row, new_row)
+
+
 class MainWindow(QMainWindow):
-    latencies_ready = Signal(list)
+    latencies_ready = Signal(int, list)
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("ambox")
         self.resize(430, 820)
         self.setMinimumSize(360, 680)
+        self._app_icon = self._build_app_icon()
+        self.setWindowIcon(self._app_icon)
 
         self.profiles: list[Profile] = []
         self.profile_latencies: list[int | None] = []
         self.profile_usage_bytes: list[int] = []
         self._pending_latency_indices: set[int] = set()
+        self._visible_profile_indices: list[int] = []
         self.connected_index: int | None = None
         self._scan_in_progress = False
+        self._pending_latency_refresh = False
+        self._active_scan_id = 0
         self._latency_has_results = False
         self._last_latency_update_text = "never"
         self._last_auto_switch = 0.0
@@ -62,6 +125,8 @@ class MainWindow(QMainWindow):
         self._usage_dirty = False
         self._last_usage_persist = 0.0
         self._traffic_last_total: int | None = None
+        self._last_used_store: dict[str, float] = {}
+        self._last_vpn_status = "disconnected"
 
         self.vpn = VpnManager()
         self.settings = QSettings(str(settings_path()), QSettings.IniFormat)
@@ -72,8 +137,10 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._restore_settings()
         self._restore_profiles()
+        self._setup_notifications()
         self._set_status("disconnected")
         self.vpn.refresh_singbox_availability()
+        self._warn_if_not_running_as_sudo()
 
         self.latency_timer = QTimer(self)
         self.latency_timer.setInterval(10000)
@@ -94,6 +161,7 @@ class MainWindow(QMainWindow):
         root = QWidget(self)
         root.setObjectName("root")
         self.setCentralWidget(root)
+        root.setAcceptDrops(True)
 
         main = QVBoxLayout(root)
         main.setContentsMargins(0, 0, 0, 0)
@@ -189,7 +257,6 @@ class MainWindow(QMainWindow):
 
         self.quick_profile_frame.setVisible(False)
         connect_layout.addWidget(self.quick_profile_frame)
-
         self.content_stack.addWidget(connect_tab)
 
         profiles_tab = QWidget()
@@ -205,10 +272,31 @@ class MainWindow(QMainWindow):
         self.profile_latency_label.setObjectName("softHint")
         profiles_layout.addWidget(self.profile_latency_label)
 
-        self.profile_list = QListWidget()
+        profile_tools = QHBoxLayout()
+        profile_tools.setSpacing(8)
+
+        self.profile_search_edit = QLineEdit()
+        self.profile_search_edit.setObjectName("profileSearch")
+        self.profile_search_edit.setPlaceholderText("Search profiles")
+        profile_tools.addWidget(self.profile_search_edit, 1)
+
+        self.profile_sort_combo = QComboBox()
+        self.profile_sort_combo.addItem("Manual order", "manual")
+        self.profile_sort_combo.addItem("Name", "name")
+        self.profile_sort_combo.addItem("Latency", "latency")
+        self.profile_sort_combo.addItem("Recently used", "recent")
+        profile_tools.addWidget(self.profile_sort_combo)
+        profiles_layout.addLayout(profile_tools)
+
+        self.profile_list = ProfileListWidget()
         self.profile_list.setObjectName("profiles")
         self.profile_list.setContextMenuPolicy(Qt.CustomContextMenu)
         profiles_layout.addWidget(self.profile_list, 1)
+
+        self.profile_list_hint = QLabel("Right click for actions. Drag to reorder in manual mode. Double click to connect. Drop files here to import.")
+        self.profile_list_hint.setObjectName("softHint")
+        self.profile_list_hint.setWordWrap(True)
+        profiles_layout.addWidget(self.profile_list_hint)
 
         profile_buttons = QHBoxLayout()
         profile_buttons.setSpacing(8)
@@ -216,10 +304,13 @@ class MainWindow(QMainWindow):
         import_btn.clicked.connect(self.import_config)
         clip_btn = QPushButton("Paste clipboard")
         clip_btn.clicked.connect(self.import_from_clipboard)
+        export_btn = QPushButton("Export")
+        export_btn.clicked.connect(self.export_selected_profile)
         delete_btn = QPushButton("Delete")
         delete_btn.clicked.connect(self.delete_selected_profile)
         profile_buttons.addWidget(import_btn)
         profile_buttons.addWidget(clip_btn)
+        profile_buttons.addWidget(export_btn)
         profile_buttons.addWidget(delete_btn)
         profiles_layout.addLayout(profile_buttons)
         self.content_stack.addWidget(profiles_tab)
@@ -361,6 +452,16 @@ class MainWindow(QMainWindow):
         logs_title.setObjectName("sectionTitle")
         logs_layout.addWidget(logs_title)
 
+        log_buttons = QHBoxLayout()
+        log_buttons.setSpacing(8)
+        self.copy_logs_btn = QPushButton("Copy logs")
+        self.clear_logs_btn = QPushButton("Clear logs")
+        self.open_log_file_btn = QPushButton("Open log file")
+        log_buttons.addWidget(self.copy_logs_btn)
+        log_buttons.addWidget(self.clear_logs_btn)
+        log_buttons.addWidget(self.open_log_file_btn)
+        logs_layout.addLayout(log_buttons)
+
         self.logs = QTextEdit()
         self.logs.setReadOnly(True)
         self.logs.setObjectName("logs")
@@ -384,7 +485,6 @@ class MainWindow(QMainWindow):
 
         phone_layout.addWidget(bottom_nav)
         self._set_bottom_page(0)
-
         main.addWidget(phone_shell, 1, Qt.AlignHCenter)
 
         self.setStyleSheet(
@@ -606,6 +706,50 @@ class MainWindow(QMainWindow):
             """
         )
 
+    def _setup_notifications(self) -> None:
+        self.tray_icon: QSystemTrayIcon | None = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(self._app_icon)
+        self.tray_icon.setToolTip("ambox")
+        self.tray_icon.show()
+
+    def _build_app_icon(self) -> QIcon:
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(Qt.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#111621"))
+        painter.drawRoundedRect(4, 4, 56, 56, 16, 16)
+
+        painter.setBrush(QColor("#f0b774"))
+        painter.drawRoundedRect(10, 10, 44, 44, 14, 14)
+
+        painter.setBrush(QColor("#171b26"))
+        painter.drawEllipse(18, 18, 28, 28)
+
+        pen = QPen(QColor("#fff3de"))
+        pen.setWidth(3)
+        painter.setPen(pen)
+        painter.drawArc(17, 17, 30, 30, 35 * 16, 240 * 16)
+
+        painter.setPen(QColor("#171b26"))
+        font = QFont("Noto Sans", 16)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(pixmap.rect(), Qt.AlignCenter, "A")
+
+        painter.end()
+        return QIcon(pixmap)
+
+    def _notify_user(self, title: str, message: str) -> None:
+        if self.tray_icon is not None:
+            self.tray_icon.showMessage(title, message, QSystemTrayIcon.Information, 3000)
+
     def _set_bottom_page(self, index: int) -> None:
         if index < 0 or index >= self.content_stack.count():
             return
@@ -621,13 +765,17 @@ class MainWindow(QMainWindow):
         else:
             suffix = "timeout" if latency is None else f"{latency} ms"
         usage = self.profile_usage_bytes[index] if index < len(self.profile_usage_bytes) else 0
-        return f"{profile.name}  [{suffix} | {self._format_bytes(usage)}]"
+        connected = "[Connected] " if self.connected_index == index and self.vpn.status in {"connected", "connecting"} else ""
+        return f"{connected}{profile.name}  [{suffix} | {self._format_bytes(usage)}]"
 
     def _profile_usage_key(self, profile: Profile) -> str:
         try:
             return json.dumps(profile.outbound, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         except (TypeError, ValueError):
             return profile.name
+
+    def _profile_last_used_key(self, profile: Profile) -> str:
+        return self._profile_usage_key(profile)
 
     def _format_bytes(self, value: int) -> str:
         units = ["B", "KB", "MB", "GB", "TB"]
@@ -662,48 +810,106 @@ class MainWindow(QMainWindow):
         self._usage_dirty = False
         self._last_usage_persist = now
 
-    def _on_traffic_tick(self) -> None:
-        if self.vpn.status != "connected":
-            self._traffic_last_total = None
-            return
-        if self.connected_index is None or self.connected_index >= len(self.profiles):
-            self._traffic_last_total = None
-            return
+    def _persist_last_used_store(self) -> None:
+        self.settings.setValue("profile_last_used", json.dumps(self._last_used_store, ensure_ascii=True))
+        self.settings.sync()
+        ensure_user_owned(settings_path())
 
-        counters = self._read_interface_counters()
-        if counters is None:
+    def _touch_profile_last_used(self, index: int) -> None:
+        if index < 0 or index >= len(self.profiles):
             return
-        total = counters[0] + counters[1]
-        if self._traffic_last_total is None:
-            self._traffic_last_total = total
-            return
+        key = self._profile_last_used_key(self.profiles[index])
+        self._last_used_store[key] = time.time()
+        self._persist_last_used_store()
 
-        delta = total - self._traffic_last_total
-        self._traffic_last_total = total
-        if delta <= 0:
-            return
-
-        idx = self.connected_index
-        self.profile_usage_bytes[idx] += delta
-        key = self._profile_usage_key(self.profiles[idx])
-        self._usage_store[key] = self.profile_usage_bytes[idx]
-        self._usage_dirty = True
-
-        item = self.profile_list.item(idx)
-        if item is not None:
-            item.setText(self._profile_item_text(idx))
-        if idx < self.quick_profile_combo.count():
-            self.quick_profile_combo.setItemText(idx, self._profile_item_text(idx))
-        self._persist_usage_store()
+    def _profile_last_used_timestamp(self, index: int) -> float:
+        if index < 0 or index >= len(self.profiles):
+            return 0.0
+        return float(self._last_used_store.get(self._profile_last_used_key(self.profiles[index]), 0.0))
 
     def _refresh_latency_update_labels(self) -> None:
         text = f"Latency update: {self._last_latency_update_text}"
         self.profile_latency_label.setText(text)
         self.quick_profile_latency_label.setText(text)
 
+    def _sorted_profile_indices(self) -> list[int]:
+        indices = list(range(len(self.profiles)))
+        search_text = self.profile_search_edit.text().strip().lower()
+        if search_text:
+            indices = [idx for idx in indices if search_text in self.profiles[idx].name.lower()]
+
+        sort_mode = str(self.profile_sort_combo.currentData() or "manual")
+        if sort_mode == "name":
+            indices.sort(key=lambda idx: self.profiles[idx].name.lower())
+        elif sort_mode == "latency":
+            indices.sort(
+                key=lambda idx: (
+                    self.profile_latencies[idx] is None,
+                    self.profile_latencies[idx] if self.profile_latencies[idx] is not None else 10**9,
+                    self.profiles[idx].name.lower(),
+                )
+            )
+        elif sort_mode == "recent":
+            indices.sort(key=lambda idx: (-self._profile_last_used_timestamp(idx), self.profiles[idx].name.lower()))
+        return indices
+
+    def _set_selected_profile_index(self, profile_index: int | None) -> None:
+        if profile_index is None:
+            self.profile_list.clearSelection()
+            self.profile_list.setCurrentRow(-1)
+            return
+        for row in range(self.profile_list.count()):
+            item = self.profile_list.item(row)
+            if item is None:
+                continue
+            if item.data(Qt.UserRole) == profile_index:
+                self.profile_list.setCurrentRow(row)
+                return
+
+    def _update_profile_list_capabilities(self) -> None:
+        manual_mode = str(self.profile_sort_combo.currentData() or "manual") == "manual"
+        drag_enabled = manual_mode and not self.profile_search_edit.text().strip()
+        self.profile_list.setDragEnabled(drag_enabled)
+        self.profile_list.setDragDropMode(QAbstractItemView.InternalMove if drag_enabled else QAbstractItemView.NoDragDrop)
+        if drag_enabled:
+            self.profile_list_hint.setText(
+                "Right click for actions. Drag to reorder in manual mode. Double click to connect. Drop files here to import."
+            )
+        else:
+            self.profile_list_hint.setText(
+                "Right click for actions. Drag reorder is available only in manual order with empty search. Drop files here to import."
+            )
+
+    def _rebuild_profile_list(self, preserve_selection: bool = True) -> None:
+        selected = self._selected_profile_index() if preserve_selection else None
+        self._visible_profile_indices = self._sorted_profile_indices()
+        self.profile_list.blockSignals(True)
+        self.profile_list.clear()
+        for profile_index in self._visible_profile_indices:
+            item = QListWidgetItem(self._profile_item_text(profile_index))
+            item.setData(Qt.UserRole, profile_index)
+            profile = self.profiles[profile_index]
+            latency = self.profile_latencies[profile_index] if profile_index < len(self.profile_latencies) else None
+            tooltip = [profile.name]
+            tooltip.append(f"Latency: {'timeout' if latency is None else f'{latency} ms'}")
+            tooltip.append(f"Traffic: {self._format_bytes(self.profile_usage_bytes[profile_index])}")
+            last_used = self._profile_last_used_timestamp(profile_index)
+            if last_used > 0:
+                tooltip.append(f"Last used: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_used))}")
+            item.setToolTip("\n".join(tooltip))
+            self.profile_list.addItem(item)
+        self.profile_list.blockSignals(False)
+        self._update_profile_list_capabilities()
+
+        if selected is not None:
+            self._set_selected_profile_index(selected)
+        elif self.profile_list.count() > 0:
+            self.profile_list.setCurrentRow(0)
+        else:
+            self.profile_list.setCurrentRow(-1)
+
     def _sync_quick_profile_selector(self) -> None:
         labels = [self._profile_item_text(idx) for idx in range(len(self.profiles))]
-
         current = self._selected_profile_index()
         if current is None and labels:
             current = 0
@@ -711,12 +917,13 @@ class MainWindow(QMainWindow):
         self.quick_profile_combo.blockSignals(True)
         if self.quick_profile_combo.count() != len(labels):
             self.quick_profile_combo.clear()
-            for label in labels:
-                self.quick_profile_combo.addItem(label)
+            for idx, label in enumerate(labels):
+                self.quick_profile_combo.addItem(label, idx)
         else:
             for idx, label in enumerate(labels):
                 if self.quick_profile_combo.itemText(idx) != label:
                     self.quick_profile_combo.setItemText(idx, label)
+                self.quick_profile_combo.setItemData(idx, idx)
         if current is not None and 0 <= current < self.quick_profile_combo.count():
             self.quick_profile_combo.setCurrentIndex(current)
         self.quick_profile_combo.blockSignals(False)
@@ -724,23 +931,32 @@ class MainWindow(QMainWindow):
         self.quick_profile_frame.setVisible(len(labels) > 1)
         self.quick_profile_combo.setEnabled(len(labels) > 1)
 
+    def _refresh_profile_views(self, preserve_selection: bool = True) -> None:
+        self._rebuild_profile_list(preserve_selection=preserve_selection)
+        self._sync_quick_profile_selector()
+        self._refresh_latency_update_labels()
+
     def _on_profile_list_row_changed(self, row: int) -> None:
         if row < 0:
             return
-        if row >= self.quick_profile_combo.count():
+        item = self.profile_list.item(row)
+        if item is None:
             return
-        if self.quick_profile_combo.currentIndex() == row:
+        profile_index = item.data(Qt.UserRole)
+        if not isinstance(profile_index, int):
+            return
+        if self.quick_profile_combo.currentIndex() == profile_index:
             return
         self.quick_profile_combo.blockSignals(True)
-        self.quick_profile_combo.setCurrentIndex(row)
+        self.quick_profile_combo.setCurrentIndex(profile_index)
         self.quick_profile_combo.blockSignals(False)
 
-    def _on_quick_profile_changed(self, index: int) -> None:
-        if index < 0 or index >= len(self.profiles):
+    def _on_quick_profile_changed(self, combo_index: int) -> None:
+        if combo_index < 0 or combo_index >= len(self.profiles):
             return
-        if self.profile_list.currentRow() == index:
+        if self._selected_profile_index() == combo_index:
             return
-        self.profile_list.setCurrentRow(index)
+        self._set_selected_profile_index(combo_index)
 
     def _build_menu(self) -> None:
         menu = self.menuBar().addMenu("File")
@@ -772,14 +988,20 @@ class MainWindow(QMainWindow):
         self.latencies_ready.connect(self._on_latencies_ready)
         self.profile_list.currentRowChanged.connect(self._on_profile_list_row_changed)
         self.profile_list.customContextMenuRequested.connect(self._show_profile_context_menu)
+        self.profile_list.itemDoubleClicked.connect(lambda _item: self._connect_selected_profile())
+        self.profile_list.files_dropped.connect(self._import_dropped_files)
+        self.profile_list.items_reordered.connect(self._on_profile_items_reordered)
         self.quick_profile_combo.currentIndexChanged.connect(self._on_quick_profile_changed)
+        self.profile_search_edit.textChanged.connect(self._on_profile_filter_changed)
+        self.profile_sort_combo.currentIndexChanged.connect(self._on_profile_filter_changed)
+        self.copy_logs_btn.clicked.connect(self.copy_logs)
+        self.clear_logs_btn.clicked.connect(self.clear_logs)
+        self.open_log_file_btn.clicked.connect(self.open_log_file)
         self.auto_switch_checkbox.toggled.connect(lambda checked: self.settings.setValue("auto_switch", checked))
         self.timeout_spin.valueChanged.connect(lambda value: self.settings.setValue("timeout_ms", value))
         self.route_mode_combo.currentIndexChanged.connect(self._on_route_mode_changed)
         self.dns_mode_combo.currentIndexChanged.connect(self._on_dns_mode_changed)
-        self.custom_dns_edit.textChanged.connect(
-            lambda value: self.settings.setValue("route_custom_dns", value)
-        )
+        self.custom_dns_edit.textChanged.connect(lambda value: self.settings.setValue("route_custom_dns", value))
         self.include_subdomains_checkbox.toggled.connect(
             lambda checked: self.settings.setValue("route_include_subdomains", checked)
         )
@@ -799,6 +1021,7 @@ class MainWindow(QMainWindow):
         include_subdomains = self.settings.value("route_include_subdomains", True, type=bool)
         route_domains_text = self.settings.value("route_domains_text", "", type=str) or ""
         usage_raw = self.settings.value("profile_usage_bytes", "{}", type=str) or "{}"
+        last_used_raw = self.settings.value("profile_last_used", "{}", type=str) or "{}"
         try:
             parsed_usage = json.loads(usage_raw)
             if isinstance(parsed_usage, dict):
@@ -807,6 +1030,14 @@ class MainWindow(QMainWindow):
                 self._usage_store = {}
         except (ValueError, TypeError):
             self._usage_store = {}
+        try:
+            parsed_last_used = json.loads(last_used_raw)
+            if isinstance(parsed_last_used, dict):
+                self._last_used_store = {str(k): float(v) for k, v in parsed_last_used.items()}
+            else:
+                self._last_used_store = {}
+        except (ValueError, TypeError):
+            self._last_used_store = {}
 
         self.auto_switch_checkbox.setChecked(auto_switch)
         self.timeout_spin.setValue(timeout_ms)
@@ -854,6 +1085,21 @@ class MainWindow(QMainWindow):
             self._apply_loaded_profiles(loaded, persist=False)
             self._append_log(f"Loaded {len(loaded)} saved profile(s) from {path}")
 
+    def _write_profiles_atomically(self, payload: dict) -> None:
+        path = profiles_path()
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        backup_path = path.with_suffix(path.suffix + ".bak")
+        tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        ensure_user_owned(tmp_path)
+        if path.exists():
+            try:
+                shutil.copy2(path, backup_path)
+                ensure_user_owned(backup_path)
+            except OSError:
+                pass
+        tmp_path.replace(path)
+        ensure_user_owned(path)
+
     def _save_profiles(self) -> None:
         payload = {
             "profiles": [
@@ -862,9 +1108,7 @@ class MainWindow(QMainWindow):
             ]
         }
         try:
-            path = profiles_path()
-            path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-            ensure_user_owned(path)
+            self._write_profiles_atomically(payload)
         except OSError as exc:
             self._append_log(f"Failed to save profiles: {exc}")
 
@@ -909,6 +1153,38 @@ class MainWindow(QMainWindow):
     def install_singbox(self) -> None:
         self.vpn.install_singbox()
 
+    def _warn_if_not_running_as_sudo(self) -> None:
+        if os.name != "posix":
+            return
+        try:
+            is_root = os.geteuid() == 0
+        except AttributeError:
+            return
+        if is_root:
+            return
+
+        message = (
+            "Run the application with sudo, otherwise VPN connection and TUN setup may not work correctly."
+        )
+        QMessageBox.warning(self, "Run with sudo", message)
+        self._append_log(f"WARNING: {message}")
+
+    def _load_profiles_from_paths(self, paths: list[Path], source_label: str) -> None:
+        imported_total = 0
+        for path in paths:
+            try:
+                loaded = load_profiles(path)
+            except (OSError, ValueError, ConfigError) as exc:
+                self._append_log(f"Failed to import {path}: {exc}")
+                continue
+            self._apply_loaded_profiles(loaded)
+            imported_total += len(loaded)
+            self._append_log(f"Imported {len(loaded)} profile(s) from {source_label}: {path}")
+        if imported_total:
+            self._notify_user("Profiles imported", f"Imported {imported_total} profile(s)")
+        else:
+            self._show_error("No valid profiles were imported")
+
     def import_config(self) -> None:
         path_str, _ = QFileDialog.getOpenFileName(
             self,
@@ -918,15 +1194,13 @@ class MainWindow(QMainWindow):
         )
         if not path_str:
             return
+        self._load_profiles_from_paths([Path(path_str)], "file")
 
-        try:
-            loaded = load_profiles(Path(path_str))
-        except (OSError, ValueError, ConfigError) as exc:
-            self._show_error(f"Failed to import config: {exc}")
+    def _import_dropped_files(self, paths: list[str]) -> None:
+        candidates = [Path(path) for path in paths if Path(path).is_file()]
+        if not candidates:
             return
-
-        self._apply_loaded_profiles(loaded)
-        self._append_log(f"Imported {len(loaded)} profile(s) from file: {path_str}")
+        self._load_profiles_from_paths(candidates, "drag-and-drop")
 
     def import_from_clipboard(self) -> None:
         clipboard = QApplication.clipboard()
@@ -943,7 +1217,7 @@ class MainWindow(QMainWindow):
         if "\n" not in maybe_path and path_candidate.is_file():
             try:
                 loaded = load_profiles(path_candidate)
-            except (OSError, ValueError, ConfigError) as exc:
+            except (OSError, ValueError, ConfigError):
                 self._show_error(
                     "Clipboard contains a file path, but this file is not a valid text VPN config. "
                     "Copy a vless/vmess/trojan/ss link or a JSON config."
@@ -951,6 +1225,7 @@ class MainWindow(QMainWindow):
                 return
             self._apply_loaded_profiles(loaded)
             self._append_log(f"Imported {len(loaded)} profile(s) from clipboard path: {path_candidate}")
+            self._notify_user("Profiles imported", f"Imported {len(loaded)} profile(s) from clipboard path")
             return
 
         try:
@@ -961,13 +1236,20 @@ class MainWindow(QMainWindow):
 
         self._apply_loaded_profiles(loaded)
         self._append_log(f"Imported {len(loaded)} profile(s) from clipboard")
+        self._notify_user("Profiles imported", f"Imported {len(loaded)} profile(s) from clipboard")
 
-    def delete_selected_profile(self) -> None:
-        index = self._selected_profile_index()
-        if index is None:
-            self._show_error("Choose a profile to delete")
-            return
+    def _confirm_delete_profile(self, index: int) -> bool:
+        profile = self.profiles[index]
+        answer = QMessageBox.question(
+            self,
+            "Delete profile",
+            f'Delete profile "{profile.name}"?',
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        return answer == QMessageBox.Yes
 
+    def _delete_profile_at_index(self, index: int) -> None:
         profile = self.profiles[index]
         if self.connected_index == index:
             self.vpn.disconnect()
@@ -981,41 +1263,154 @@ class MainWindow(QMainWindow):
             if item != index
         }
 
-        if self.connected_index is not None and self.connected_index > index:
-            self.connected_index -= 1
+        if self.connected_index is not None:
+            if self.connected_index == index:
+                self.connected_index = None
+            elif self.connected_index > index:
+                self.connected_index -= 1
 
-        self.profile_list.takeItem(index)
         self._usage_store.pop(self._profile_usage_key(profile), None)
+        self._last_used_store.pop(self._profile_last_used_key(profile), None)
         self._usage_dirty = True
         self._persist_usage_store(force=True)
+        self._persist_last_used_store()
         self._save_profiles()
 
-        if self.profiles:
-            self.profile_list.setCurrentRow(min(index, len(self.profiles) - 1))
-        else:
-            self.profile_list.clearSelection()
+        if not self.profiles:
             self._latency_has_results = False
             self._last_latency_update_text = "never"
-        self._sync_quick_profile_selector()
-        self._refresh_latency_update_labels()
+
+        self._refresh_profile_views()
         self._append_log(f"Deleted profile: {profile.name}")
+        self._notify_user("Profile deleted", profile.name)
+        self.refresh_latencies()
+
+    def delete_selected_profile(self) -> None:
+        index = self._selected_profile_index()
+        if index is None:
+            self._show_error("Choose a profile to delete")
+            return
+        if not self._confirm_delete_profile(index):
+            return
+        self._delete_profile_at_index(index)
+
+    def rename_selected_profile(self) -> None:
+        index = self._selected_profile_index()
+        if index is None:
+            self._show_error("Choose a profile to rename")
+            return
+        profile = self.profiles[index]
+        new_name, ok = QInputDialog.getText(self, "Rename profile", "New profile name:", text=profile.name)
+        if not ok:
+            return
+        name = new_name.strip()
+        if not name:
+            self._show_error("Profile name cannot be empty")
+            return
+        profile.name = name
+        self._save_profiles()
+        self._refresh_profile_views()
+        self._append_log(f"Renamed profile to: {name}")
+
+    def _unique_profile_name(self, base_name: str) -> str:
+        existing = {profile.name for profile in self.profiles}
+        if base_name not in existing:
+            return base_name
+        counter = 2
+        while True:
+            candidate = f"{base_name} ({counter})"
+            if candidate not in existing:
+                return candidate
+            counter += 1
+
+    def duplicate_selected_profile(self) -> None:
+        index = self._selected_profile_index()
+        if index is None:
+            self._show_error("Choose a profile to duplicate")
+            return
+        source = self.profiles[index]
+        duplicate = Profile(
+            name=self._unique_profile_name(f"{source.name} copy"),
+            outbound=deepcopy(source.outbound),
+        )
+        insert_at = index + 1
+        self.profiles.insert(insert_at, duplicate)
+        self.profile_latencies.insert(insert_at, None)
+        self.profile_usage_bytes.insert(insert_at, 0)
+        self._pending_latency_indices = {item + 1 if item >= insert_at else item for item in self._pending_latency_indices}
+        self._pending_latency_indices.add(insert_at)
+        if self.connected_index is not None and self.connected_index >= insert_at:
+            self.connected_index += 1
+        self._save_profiles()
+        self._refresh_profile_views()
+        self._set_selected_profile_index(insert_at)
+        self._append_log(f"Duplicated profile: {source.name}")
+        self.refresh_latencies()
+
+    def export_selected_profile(self) -> None:
+        index = self._selected_profile_index()
+        if index is None:
+            self._show_error("Choose a profile to export")
+            return
+        profile = self.profiles[index]
+        default_name = profile.name.replace("/", "_").replace("\\", "_") or "profile"
+        path_str, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export profile",
+            str(import_configs_dir() / f"{default_name}.json"),
+            "JSON files (*.json);;All files (*)",
+        )
+        if not path_str:
+            return
+        target = Path(path_str)
+        payload = {"name": profile.name, "outbound": profile.outbound}
+        try:
+            target.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            self._show_error(f"Failed to export profile: {exc}")
+            return
+        self._append_log(f"Exported profile to: {target}")
+        self._notify_user("Profile exported", profile.name)
 
     def _show_profile_context_menu(self, pos) -> None:
         item = self.profile_list.itemAt(pos)
+        menu = QMenu(self)
         if item is None:
+            import_action = menu.addAction("Import file")
+            paste_action = menu.addAction("Paste clipboard")
+            selected_action = menu.exec(self.profile_list.viewport().mapToGlobal(pos))
+            if selected_action is import_action:
+                self.import_config()
+            elif selected_action is paste_action:
+                self.import_from_clipboard()
             return
 
         row = self.profile_list.row(item)
-        if row < 0 or row >= len(self.profiles):
+        if row < 0:
             return
+        profile_index = item.data(Qt.UserRole)
+        if not isinstance(profile_index, int) or profile_index >= len(self.profiles):
+            return
+        self._set_selected_profile_index(profile_index)
+        profile = self.profiles[profile_index]
 
-        if self.profile_list.currentRow() != row:
-            self.profile_list.setCurrentRow(row)
-
-        menu = QMenu(self)
-        delete_action = menu.addAction("Delete")
+        connect_action = menu.addAction("Connect")
+        rename_action = menu.addAction("Rename")
+        duplicate_action = menu.addAction("Duplicate")
+        export_action = menu.addAction("Export")
+        delete_action = menu.addAction(f'Delete "{profile.name}"')
+        if self.vpn.status in {"connected", "connecting"} and self.connected_index == profile_index:
+            connect_action.setText("Reconnect")
         selected_action = menu.exec(self.profile_list.viewport().mapToGlobal(pos))
-        if selected_action is delete_action:
+        if selected_action is connect_action:
+            self._connect_profile(profile_index)
+        elif selected_action is rename_action:
+            self.rename_selected_profile()
+        elif selected_action is duplicate_action:
+            self.duplicate_selected_profile()
+        elif selected_action is export_action:
+            self.export_selected_profile()
+        elif selected_action is delete_action:
             self.delete_selected_profile()
 
     def _apply_loaded_profiles(self, loaded: list[Profile], persist: bool = True) -> None:
@@ -1030,21 +1425,32 @@ class MainWindow(QMainWindow):
             usage = int(self._usage_store.get(self._profile_usage_key(profile), 0))
             self.profile_usage_bytes.append(usage)
             self._pending_latency_indices.add(idx)
-            QListWidgetItem(self._profile_item_text(idx), self.profile_list)
         if not self._latency_has_results:
             self._last_latency_update_text = "pending..."
-        self.profile_list.setCurrentRow(start_index if start_index < len(self.profiles) else 0)
-        self._sync_quick_profile_selector()
-        self._refresh_latency_update_labels()
         if persist:
             self._save_profiles()
+        self._refresh_profile_views()
+        self._set_selected_profile_index(start_index if start_index < len(self.profiles) else 0)
         self.refresh_latencies()
 
     def _selected_profile_index(self) -> int | None:
-        row = self.profile_list.currentRow()
-        if row < 0 or row >= len(self.profiles):
+        item = self.profile_list.currentItem()
+        if item is None:
             return None
-        return row
+        row = self.profile_list.currentRow()
+        if row < 0:
+            return None
+        profile_index = item.data(Qt.UserRole)
+        if not isinstance(profile_index, int) or profile_index < 0 or profile_index >= len(self.profiles):
+            return None
+        return profile_index
+
+    def _connect_selected_profile(self) -> None:
+        index = self._selected_profile_index()
+        if index is None:
+            self._show_error("Choose a profile first")
+            return
+        self._connect_profile(index)
 
     def toggle_connection(self) -> None:
         if self.vpn.status in {"connected", "connecting"}:
@@ -1056,7 +1462,7 @@ class MainWindow(QMainWindow):
             best = self._best_profile_index()
             if best is not None:
                 index = best
-                self.profile_list.setCurrentRow(best)
+                self._set_selected_profile_index(best)
 
         if index is None:
             self._show_error("Choose a profile first")
@@ -1080,10 +1486,12 @@ class MainWindow(QMainWindow):
             self.vpn.disconnect()
 
         self.connected_index = index
+        self._touch_profile_last_used(index)
         profile = self.profiles[index]
         self.vpn.connect_profile(profile, routing)
         if self.vpn.status == "disconnected":
             self.connected_index = None
+        self._refresh_profile_views()
 
     def _routing_options(self) -> RoutingOptions:
         mode = str(self.route_mode_combo.currentData() or "all")
@@ -1096,39 +1504,105 @@ class MainWindow(QMainWindow):
             domains=domains,
         )
 
+    def _on_profile_filter_changed(self) -> None:
+        self._refresh_profile_views()
+
+    def _move_profile(self, source_index: int, target_index: int) -> None:
+        if source_index == target_index:
+            return
+        if source_index < 0 or source_index >= len(self.profiles):
+            return
+        if target_index < 0:
+            target_index = 0
+        if target_index >= len(self.profiles):
+            target_index = len(self.profiles) - 1
+
+        moved_profile = self.profiles.pop(source_index)
+        moved_latency = self.profile_latencies.pop(source_index)
+        moved_usage = self.profile_usage_bytes.pop(source_index)
+        self.profiles.insert(target_index, moved_profile)
+        self.profile_latencies.insert(target_index, moved_latency)
+        self.profile_usage_bytes.insert(target_index, moved_usage)
+
+        old_pending = self._pending_latency_indices.copy()
+        self._pending_latency_indices.clear()
+        for item in old_pending:
+            if item == source_index:
+                self._pending_latency_indices.add(target_index)
+                continue
+            if source_index < target_index and source_index < item <= target_index:
+                self._pending_latency_indices.add(item - 1)
+                continue
+            if target_index <= item < source_index:
+                self._pending_latency_indices.add(item + 1)
+                continue
+            self._pending_latency_indices.add(item)
+
+        if self.connected_index is not None:
+            if self.connected_index == source_index:
+                self.connected_index = target_index
+            elif source_index < target_index and source_index < self.connected_index <= target_index:
+                self.connected_index -= 1
+            elif target_index <= self.connected_index < source_index:
+                self.connected_index += 1
+
+    def _on_profile_items_reordered(self, old_row: int, new_row: int) -> None:
+        manual_mode = str(self.profile_sort_combo.currentData() or "manual") == "manual"
+        if not manual_mode or self.profile_search_edit.text().strip():
+            self._refresh_profile_views()
+            return
+        self._move_profile(old_row, new_row)
+        self._save_profiles()
+        self._refresh_profile_views()
+        self._set_selected_profile_index(new_row)
+        self._append_log("Reordered profiles")
+
     def refresh_latencies(self) -> None:
-        if not self.profiles or self._scan_in_progress:
+        if not self.profiles:
+            return
+        if self._scan_in_progress:
+            self._pending_latency_refresh = True
+            self._last_latency_update_text = "scan already running..."
+            self._refresh_latency_update_labels()
             return
 
         timeout_sec = self.timeout_spin.value() / 1000.0
         snapshot = list(self.profiles)
         self._scan_in_progress = True
+        self._pending_latency_refresh = False
+        self._active_scan_id += 1
+        scan_id = self._active_scan_id
+        self._last_latency_update_text = "scanning..."
+        self._refresh_latency_update_labels()
         worker = threading.Thread(
             target=self._scan_latency_worker,
-            args=(snapshot, timeout_sec),
+            args=(scan_id, snapshot, timeout_sec),
             daemon=True,
         )
         worker.start()
 
-    def _scan_latency_worker(self, profiles: list[Profile], timeout_sec: float) -> None:
+    def _scan_latency_worker(self, scan_id: int, profiles: list[Profile], timeout_sec: float) -> None:
         results = [profile_latency_ms(profile, timeout_sec) for profile in profiles]
-        self.latencies_ready.emit(results)
+        self.latencies_ready.emit(scan_id, results)
 
-    def _on_latencies_ready(self, latencies: list[int | None]) -> None:
+    def _on_latencies_ready(self, scan_id: int, latencies: list[int | None]) -> None:
+        if scan_id != self._active_scan_id:
+            return
+
         self._scan_in_progress = False
         if len(latencies) != len(self.profiles):
+            if self._pending_latency_refresh:
+                self.refresh_latencies()
             return
 
         self.profile_latencies = latencies
         self._pending_latency_indices.clear()
         self._latency_has_results = True
         self._last_latency_update_text = time.strftime("%H:%M:%S")
-        for idx in range(len(self.profiles)):
-            item = self.profile_list.item(idx)
-            if item is not None:
-                item.setText(self._profile_item_text(idx))
-        self._sync_quick_profile_selector()
-        self._refresh_latency_update_labels()
+        self._refresh_profile_views()
+
+        if self._pending_latency_refresh:
+            self.refresh_latencies()
 
     def _best_profile_index(self) -> int | None:
         best_index: int | None = None
@@ -1190,16 +1664,52 @@ class MainWindow(QMainWindow):
                 f"Auto switch: {self.profiles[current].name} -> {self.profiles[best].name} "
                 f"({current_latency if current_latency is not None else 'timeout'} -> {best_latency} ms)"
             )
-            self.profile_list.setCurrentRow(best)
+            self._set_selected_profile_index(best)
             self._connect_profile(best)
 
+    def _on_traffic_tick(self) -> None:
+        if self.vpn.status != "connected":
+            self._traffic_last_total = None
+            return
+        if self.connected_index is None or self.connected_index >= len(self.profiles):
+            self._traffic_last_total = None
+            return
+
+        counters = self._read_interface_counters()
+        if counters is None:
+            return
+        total = counters[0] + counters[1]
+        if self._traffic_last_total is None:
+            self._traffic_last_total = total
+            return
+
+        delta = total - self._traffic_last_total
+        self._traffic_last_total = total
+        if delta <= 0:
+            return
+
+        idx = self.connected_index
+        self.profile_usage_bytes[idx] += delta
+        key = self._profile_usage_key(self.profiles[idx])
+        self._usage_store[key] = self.profile_usage_bytes[idx]
+        self._usage_dirty = True
+        self._refresh_profile_views()
+        self._persist_usage_store()
+
     def _on_vpn_status_changed(self, status: str) -> None:
+        previous = self._last_vpn_status
+        self._last_vpn_status = status
         self._set_status(status)
-        if status == "disconnected":
+        self._refresh_profile_views()
+        if status == "connected" and self.connected_index is not None:
+            self._notify_user("VPN connected", self.profiles[self.connected_index].name)
+        elif status == "disconnected":
             self.connected_index = None
             self._timeout_streak = 0
             self._traffic_last_total = None
             self._persist_usage_store(force=True)
+            if previous != "disconnected":
+                self._notify_user("VPN disconnected", "Connection closed")
 
     def _set_status(self, status: str) -> None:
         mapping = {
@@ -1218,15 +1728,42 @@ class MainWindow(QMainWindow):
         self.connect_btn.style().unpolish(self.connect_btn)
         self.connect_btn.style().polish(self.connect_btn)
 
+    def copy_logs(self) -> None:
+        QApplication.clipboard().setText(self.logs.toPlainText())
+        self._notify_user("Logs copied", "Current logs copied to clipboard")
+
+    def clear_logs(self) -> None:
+        self.logs.clear()
+        self._append_log("Logs cleared")
+
+    def open_log_file(self) -> None:
+        path = log_path()
+        if not path.exists():
+            try:
+                path.touch()
+                ensure_user_owned(path)
+            except OSError as exc:
+                self._show_error(f"Failed to prepare log file: {exc}")
+                return
+        opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        if not opened:
+            self._show_error(f"Failed to open log file: {path}")
+            return
+        self._append_log(f"Opened log file: {path}")
+        self._notify_user("Log file", str(path))
+
     def _append_log(self, text: str) -> None:
         self.logs.append(text)
+        logging.info(text)
 
     def _show_error(self, message: str) -> None:
         QMessageBox.critical(self, "Error", message)
-        self._append_log(f"ERROR: {message}")
+        self.logs.append(f"ERROR: {message}")
+        logging.error(message)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._persist_usage_store(force=True)
+        self._persist_last_used_store()
         self.settings.sync()
         ensure_user_owned(settings_path())
         self.vpn.disconnect()

@@ -196,6 +196,36 @@ class VpnManager(QObject):
     def has_singbox(self) -> bool:
         return self._resolve_singbox() is not None
 
+    def environment_warnings(self) -> list[str]:
+        warnings: list[str] = []
+        singbox = self._resolve_singbox()
+        if not singbox:
+            warnings.append("sing-box executable was not found in PATH or common install locations.")
+        if shutil.which("ip") is None:
+            warnings.append("The `ip` command is missing. Interface checks may be incomplete.")
+        if shutil.which("pgrep") is None:
+            warnings.append("The `pgrep` command is missing. External sing-box conflict checks may be incomplete.")
+        setcap_path = shutil.which("setcap")
+        if singbox and setcap_path is None:
+            warnings.append("The `setcap` command is missing. TUN permission setup may require manual steps.")
+        elif singbox and setcap_path is not None:
+            try:
+                cap_result = subprocess.run(
+                    [setcap_path, "-v", singbox],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                cap_text = (cap_result.stdout + cap_result.stderr).lower()
+                if cap_result.returncode != 0 and "cap_net_admin" not in cap_text:
+                    warnings.append(
+                        "sing-box may not have CAP_NET_ADMIN. If TUN setup fails, run: "
+                        'sudo setcap cap_net_admin+ep "$(command -v sing-box)"'
+                    )
+            except OSError:
+                warnings.append("Failed to verify sing-box capabilities. TUN permission issues may require manual setup.")
+        return warnings
+
     def refresh_singbox_availability(self) -> None:
         self.singbox_availability_changed.emit(self.has_singbox())
 
