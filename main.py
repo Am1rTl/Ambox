@@ -6,6 +6,7 @@ import os
 import sys
 import traceback
 
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from app.app_paths import log_path
@@ -73,6 +74,23 @@ def main(argv: list[str] | None = None) -> int:
 
     _configure_logging(args.debug)
     app = QApplication([sys.argv[0]])
+    app.setStyle("Fusion")
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor("#111621"))
+    palette.setColor(QPalette.WindowText, QColor("#d9dce3"))
+    palette.setColor(QPalette.Base, QColor("#0f1119"))
+    palette.setColor(QPalette.AlternateBase, QColor("#1c202b"))
+    palette.setColor(QPalette.ToolTipBase, QColor("#1c202b"))
+    palette.setColor(QPalette.ToolTipText, QColor("#d9dce3"))
+    palette.setColor(QPalette.Text, QColor("#d9dce3"))
+    palette.setColor(QPalette.Button, QColor("#1c202b"))
+    palette.setColor(QPalette.ButtonText, QColor("#d9dce3"))
+    palette.setColor(QPalette.BrightText, QColor("#ffffff"))
+    palette.setColor(QPalette.Link, QColor("#f0b774"))
+    palette.setColor(QPalette.Highlight, QColor("#3a3027"))
+    palette.setColor(QPalette.HighlightedText, QColor("#ffffff"))
+    app.setPalette(palette)
+    app.setStyleSheet("QToolTip { background-color: #1c202b; border: 1px solid #3a3f4d; color: #d9dce3; }")
     _install_excepthook(args.debug)
     window = MainWindow()
     window.show()

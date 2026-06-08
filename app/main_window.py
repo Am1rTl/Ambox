@@ -485,6 +485,9 @@ class MainWindow(QMainWindow):
 
         self.setStyleSheet(
             """
+            QMainWindow {
+              background-color: #0f1119;
+            }
             QWidget {
               color: #d9dce3;
               font-family: "Noto Sans", "Segoe UI", sans-serif;
