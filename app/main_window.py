@@ -1,4 +1,4 @@
-from __future__ import annotations
+Amnezia-likefrom __future__ import annotations
 
 import json
 import logging
@@ -184,7 +184,7 @@ class MainWindow(QMainWindow):
         title.setObjectName("panelTitle")
         header_layout.addWidget(title, 0, Qt.AlignHCenter)
 
-        subtitle = QLabel("Amnezia-like mobile layout")
+        subtitle = QLabel("VPN client without trash")
         subtitle.setObjectName("subtitle")
         header_layout.addWidget(subtitle, 0, Qt.AlignHCenter)
 
