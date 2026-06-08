@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.app_paths import ensure_user_owned, import_configs_dir, log_path, profiles_path, settings_path
+from app.toast import ToastNotification
 from app.config_parser import ConfigError, Profile, RoutingOptions, load_profiles, load_profiles_from_text, parse_domains_text
 from app.latency import profile_latency_ms
 from app.vpn_manager import VpnManager
@@ -187,11 +188,6 @@ class MainWindow(QMainWindow):
         subtitle.setObjectName("subtitle")
         header_layout.addWidget(subtitle, 0, Qt.AlignHCenter)
 
-        self.status_badge = QLabel("Disconnected")
-        self.status_badge.setAlignment(Qt.AlignCenter)
-        self.status_badge.setObjectName("statusDisconnected")
-        self.status_badge.setFixedHeight(32)
-        header_layout.addWidget(self.status_badge, 0, Qt.AlignHCenter)
         phone_layout.addWidget(header)
 
         self.content_stack = QStackedWidget()
@@ -692,17 +688,6 @@ class MainWindow(QMainWindow):
               border: none;
               background: transparent;
             }
-            QLabel#statusDisconnected, QLabel#statusConnecting,
-            QLabel#statusConnected, QLabel#statusDisconnecting {
-              border-radius: 10px;
-              font-weight: 700;
-              font-size: 13px;
-              padding: 5px 12px;
-            }
-            QLabel#statusDisconnected { background-color: #2a2f3b; color: #b6bfce; }
-            QLabel#statusConnecting { background-color: #3a3025; color: #ffcc9a; }
-            QLabel#statusConnected { background-color: #2d3529; color: #a9e09a; }
-            QLabel#statusDisconnecting { background-color: #3a3238; color: #e0c7d3; }
             """
         )
 
@@ -713,6 +698,7 @@ class MainWindow(QMainWindow):
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setIcon(self._app_icon)
         self.tray_icon.setToolTip("ambox")
+        self.tray_icon.activated.connect(self._on_tray_activated)
         self.tray_icon.show()
 
     def _build_app_icon(self) -> QIcon:
@@ -745,6 +731,12 @@ class MainWindow(QMainWindow):
 
         painter.end()
         return QIcon(pixmap)
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.setWindowState(self.windowState() & ~Qt.WindowMinimized | Qt.WindowActive)
 
     def _notify_user(self, title: str, message: str) -> None:
         if self.tray_icon is not None:
@@ -1702,14 +1694,14 @@ class MainWindow(QMainWindow):
         self._set_status(status)
         self._refresh_profile_views()
         if status == "connected" and self.connected_index is not None:
-            self._notify_user("VPN connected", self.profiles[self.connected_index].name)
+            ToastNotification("VPN connected", self.profiles[self.connected_index].name, True)
         elif status == "disconnected":
             self.connected_index = None
             self._timeout_streak = 0
             self._traffic_last_total = None
             self._persist_usage_store(force=True)
             if previous != "disconnected":
-                self._notify_user("VPN disconnected", "Connection closed")
+                ToastNotification("VPN disconnected", "Connection closed", False)
 
     def _set_status(self, status: str) -> None:
         mapping = {
@@ -1718,11 +1710,7 @@ class MainWindow(QMainWindow):
             "connected": ("Connected", "statusConnected", "Stop"),
             "disconnecting": ("Disconnecting...", "statusDisconnecting", "Stop"),
         }
-        text, class_name, button_text = mapping.get(status, (status, "statusDisconnected", "Connect"))
-        self.status_badge.setText(text)
-        self.status_badge.setObjectName(class_name)
-        self.status_badge.style().unpolish(self.status_badge)
-        self.status_badge.style().polish(self.status_badge)
+        button_text = mapping.get(status, (status, "statusDisconnected", "Connect"))[2]
         self.connect_btn.setText(button_text)
         self.connect_btn.setProperty("vpnState", "connected" if status == "connected" else "disconnected")
         self.connect_btn.style().unpolish(self.connect_btn)
