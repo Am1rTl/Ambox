@@ -12,6 +12,20 @@ from app.app_paths import log_path
 from app.main_window import MainWindow
 
 
+def _daemonize() -> None:
+    pid = os.fork()
+    if pid > 0:
+        os._exit(0)
+    os.setsid()
+    os.chdir("/")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    with open(os.devnull, "w") as null:
+        os.dup2(null.fileno(), sys.stdin.fileno())
+        os.dup2(null.fileno(), sys.stdout.fileno())
+        os.dup2(null.fileno(), sys.stderr.fileno())
+
+
 def _configure_logging(debug: bool) -> None:
     app_log_path = log_path()
 
@@ -52,6 +66,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
+    _daemonize()
+
     if args.debug:
         os.environ.setdefault("QT_LOGGING_RULES", "*.debug=true")
 
