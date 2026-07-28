@@ -102,3 +102,20 @@ def test_build_singbox_config_can_ignore_ru_domains() -> None:
     assert proxy_rule in rules
     assert rules.index(direct_rule) < rules.index(proxy_rule)
     assert {"domain_suffix": [".ru"], "action": "route", "server": "direct-dns"} in config["dns"]["rules"]
+
+
+def test_build_singbox_config_keeps_localhost_direct() -> None:
+    profiles = load_profiles_from_text("socks://user:pass@example.com:1080#SocksNode")
+
+    for mode in ("all", "only_selected", "all_except_selected"):
+        config = build_singbox_config(
+            profiles[0].outbound,
+            routing=RoutingOptions(mode=mode, domains=["example.com"]),
+        )
+
+        rules = config["route"]["rules"]
+        localhost_rule = {"domain": ["localhost"], "outbound": "direct"}
+        loopback_rule = {"ip_cidr": ["127.0.0.0/8", "::1/128"], "outbound": "direct"}
+        assert localhost_rule in rules
+        assert loopback_rule in rules
+        assert rules.index(localhost_rule) < rules.index(loopback_rule)

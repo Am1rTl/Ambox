@@ -553,6 +553,14 @@ def build_singbox_config(outbound: dict[str, Any], routing: RoutingOptions | Non
         default_domain_resolver = "direct-dns"
         rules.append({"protocol": "dns", "action": "hijack-dns"})
 
+    # Never send loopback requests into the TUN/proxy, regardless of routing mode.
+    rules.extend(
+        [
+            {"domain": ["localhost"], "outbound": "direct"},
+            {"ip_cidr": ["127.0.0.0/8", "::1/128"], "outbound": "direct"},
+        ]
+    )
+
     if routing.ignore_ru_domains:
         rules.append({"domain_suffix": [RU_DOMAIN_SUFFIX], "outbound": "direct"})
         if dns_mode == "proxy" and dns_config is not None:
