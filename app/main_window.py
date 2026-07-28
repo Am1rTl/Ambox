@@ -379,6 +379,9 @@ class MainWindow(QMainWindow):
         self.routing_mode_hint.setObjectName("softHint")
         settings_layout.addWidget(self.routing_mode_hint)
 
+        self.ignore_ru_domains_checkbox = QCheckBox("Ignore .ru domains")
+        settings_layout.addWidget(self.ignore_ru_domains_checkbox)
+
         self.routing_domains_frame = QFrame()
         self.routing_domains_frame.setObjectName("subCard")
         routing_layout = QVBoxLayout(self.routing_domains_frame)
@@ -997,6 +1000,9 @@ class MainWindow(QMainWindow):
         self.route_mode_combo.currentIndexChanged.connect(self._on_route_mode_changed)
         self.dns_mode_combo.currentIndexChanged.connect(self._on_dns_mode_changed)
         self.custom_dns_edit.textChanged.connect(lambda value: self.settings.setValue("route_custom_dns", value))
+        self.ignore_ru_domains_checkbox.toggled.connect(
+            lambda checked: self.settings.setValue("route_ignore_ru_domains", checked)
+        )
         self.include_subdomains_checkbox.toggled.connect(
             lambda checked: self.settings.setValue("route_include_subdomains", checked)
         )
@@ -1014,6 +1020,7 @@ class MainWindow(QMainWindow):
             route_dns_mode = "proxy" if legacy_proxy_dns else "direct"
         route_custom_dns = self.settings.value("route_custom_dns", "", type=str) or ""
         include_subdomains = self.settings.value("route_include_subdomains", True, type=bool)
+        ignore_ru_domains = self.settings.value("route_ignore_ru_domains", False, type=bool)
         route_domains_text = self.settings.value("route_domains_text", "", type=str) or ""
         usage_raw = self.settings.value("profile_usage_bytes", "{}", type=str) or "{}"
         last_used_raw = self.settings.value("profile_last_used", "{}", type=str) or "{}"
@@ -1046,6 +1053,7 @@ class MainWindow(QMainWindow):
         self.dns_mode_combo.setCurrentIndex(dns_mode_index)
         self.custom_dns_edit.setText(route_custom_dns)
         self.include_subdomains_checkbox.setChecked(include_subdomains)
+        self.ignore_ru_domains_checkbox.setChecked(ignore_ru_domains)
         self.domains_edit.setPlainText(route_domains_text)
         self._update_routing_controls()
         self._update_dns_controls()
@@ -1496,6 +1504,7 @@ class MainWindow(QMainWindow):
             dns_mode=str(self.dns_mode_combo.currentData() or "proxy"),
             custom_dns=self.custom_dns_edit.text().strip(),
             include_subdomains=self.include_subdomains_checkbox.isChecked(),
+            ignore_ru_domains=self.ignore_ru_domains_checkbox.isChecked(),
             domains=domains,
         )
 

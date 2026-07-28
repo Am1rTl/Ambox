@@ -1,7 +1,7 @@
 import base64
 import json
 
-from app.config_parser import ConfigError, build_singbox_config, load_profiles_from_text, parse_domains_text
+from app.config_parser import ConfigError, RoutingOptions, build_singbox_config, load_profiles_from_text, parse_domains_text
 
 
 def test_load_vmess_profile() -> None:
@@ -86,3 +86,19 @@ def test_build_singbox_config_custom_dns() -> None:
     )
     assert config["route"]["final"] == "proxy"
     assert config["dns"]["final"] == "proxy-dns"
+
+
+def test_build_singbox_config_can_ignore_ru_domains() -> None:
+    profiles = load_profiles_from_text("socks://user:pass@example.com:1080#SocksNode")
+    config = build_singbox_config(
+        profiles[0].outbound,
+        routing=RoutingOptions(mode="only_selected", domains=["example.ru"], ignore_ru_domains=True),
+    )
+
+    rules = config["route"]["rules"]
+    direct_rule = {"domain_suffix": [".ru"], "outbound": "direct"}
+    proxy_rule = {"domain_suffix": ["example.ru"], "outbound": "proxy"}
+    assert direct_rule in rules
+    assert proxy_rule in rules
+    assert rules.index(direct_rule) < rules.index(proxy_rule)
+    assert {"domain_suffix": [".ru"], "action": "route", "server": "direct-dns"} in config["dns"]["rules"]

@@ -8,6 +8,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from app.app_paths import singbox_cache_path
 
+RU_DOMAIN_SUFFIX = ".ru"
+
 
 @dataclass
 class Profile:
@@ -19,6 +21,7 @@ class Profile:
 class RoutingOptions:
     mode: str = "all"
     include_subdomains: bool = True
+    ignore_ru_domains: bool = False
     dns_mode: str = "proxy"
     custom_dns: str = ""
     domains: list[str] = field(default_factory=list)
@@ -456,6 +459,15 @@ def load_profiles_from_text(content: str) -> list[Profile]:
     return profiles
 
 
+def _direct_dns_server() -> dict[str, Any]:
+    return {
+        "tag": "direct-dns",
+        "type": "udp",
+        "server": "1.1.1.1",
+        "server_port": 53,
+    }
+
+
 def build_singbox_config(outbound: dict[str, Any], routing: RoutingOptions | None = None) -> dict[str, Any]:
     routing = routing or RoutingOptions()
     mode = routing.mode if routing.mode in {"all", "only_selected", "all_except_selected"} else "all"
@@ -528,12 +540,7 @@ def build_singbox_config(outbound: dict[str, Any], routing: RoutingOptions | Non
     else:
         dns_config = {
             "servers": [
-                {
-                    "tag": "direct-dns",
-                    "type": "udp",
-                    "server": "1.1.1.1",
-                    "server_port": 53,
-                },
+                _direct_dns_server(),
                 {
                     "tag": "direct-dns-fallback",
                     "type": "udp",
@@ -545,6 +552,14 @@ def build_singbox_config(outbound: dict[str, Any], routing: RoutingOptions | Non
         }
         default_domain_resolver = "direct-dns"
         rules.append({"protocol": "dns", "action": "hijack-dns"})
+
+    if routing.ignore_ru_domains:
+        rules.append({"domain_suffix": [RU_DOMAIN_SUFFIX], "outbound": "direct"})
+        if dns_mode == "proxy" and dns_config is not None:
+            dns_config["servers"].append(_direct_dns_server())
+            dns_config["rules"] = [
+                {"domain_suffix": [RU_DOMAIN_SUFFIX], "action": "route", "server": "direct-dns"}
+            ]
 
     if mode == "only_selected":
         final_outbound = "direct"
