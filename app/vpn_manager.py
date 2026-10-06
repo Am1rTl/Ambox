@@ -353,7 +353,13 @@ class VpnManager(QObject):
         self._set_status("connecting")
         self.log_line.emit(f"Starting profile: {profile.name}")
         self.log_line.emit(f"Using sing-box: {singbox}")
-        self.process.start(singbox, ["run", "-c", str(self._temp_config)])
+        program, args = singbox, ["run", "-c", str(self._temp_config)]
+        setpriv = shutil.which("setpriv")
+        if setpriv:
+            # If the GUI is SIGKILLed, the kernel sends SIGTERM to sing-box so it tears down its TUN.
+            # setpriv execs sing-box, so PID / starttime / cmdline in the journal stay sing-box's.
+            program, args = setpriv, ["--pdeathsig", "TERM", "--", singbox, *args]
+        self.process.start(program, args)
         if not self.process.waitForStarted(4000):
             self._set_status("disconnected")
             self._end_session()

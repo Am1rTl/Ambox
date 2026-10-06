@@ -23,7 +23,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from app.app_paths import ensure_app_data_dir, ensure_user_owned
+from app.app_paths import active_config_path, ensure_app_data_dir, ensure_user_owned
 
 IFACE_NAME = "ambox0"
 ROUTE_TABLE = 2090
@@ -46,6 +46,7 @@ def journal_path() -> Path:
 class NetSession:
     session_id: str
     owner_pid: int
+    owner_starttime: int = 0
     singbox_pid: int = 0
     singbox_starttime: int = 0
     config_path: str = ""
@@ -64,7 +65,19 @@ class NetSession:
 
     @staticmethod
     def new(config_path: Path) -> "NetSession":
-        return NetSession(session_id=uuid.uuid4().hex, owner_pid=os.getpid(), config_path=str(config_path))
+        pid = os.getpid()
+        return NetSession(
+            session_id=uuid.uuid4().hex,
+            owner_pid=pid,
+            owner_starttime=proc_starttime(pid),
+            config_path=str(config_path),
+        )
+
+    def owner_alive(self) -> bool:
+        if not pid_alive(self.owner_pid):
+            return False
+        # Old journals have no starttime; otherwise a reused PID must not count as the owner.
+        return not self.owner_starttime or proc_starttime(self.owner_pid) == self.owner_starttime
 
 
 # ---------------------------------------------------------------- journal ---
@@ -174,6 +187,26 @@ def _rule_pref(line: str) -> int:
     return int(m.group(1)) if m else -1
 
 
+def is_own_rule(line: str) -> bool:
+    """A rule in our priority range that only refers to our table / builtin tables / our range.
+
+    sing-box rules carry no interface name (``lookup 2090``, ``lookup main suppress_prefixlength 0``,
+    ``goto 9110``, ``nop``), so ownership is "nothing in it points at somebody else's table".
+    """
+    if _rule_pref(line) not in RULE_RANGE:
+        return False
+    for table in re.findall(r"\blookup (\S+)", line):
+        if table not in _OWN_OR_BUILTIN_TABLES:
+            return False
+    for target in re.findall(r"\bgoto (\d+)", line):
+        if int(target) not in RULE_RANGE:
+            return False
+    return True
+
+
+_OWN_OR_BUILTIN_TABLES = {str(ROUTE_TABLE), "main", "local", "default", "253", "254", "255"}
+
+
 def interface_exists(name: str) -> bool:
     return Path("/sys/class/net", name).exists()
 
@@ -234,7 +267,7 @@ def detect_foreign_vpn(own_pids: set[int]) -> str | None:
             "Disable it before connecting."
         )
     for line in _ip_lines("rule", "show"):
-        if _rule_pref(line) in RULE_RANGE and IFACE_NAME not in line:
+        if _rule_pref(line) in RULE_RANGE and not is_own_rule(line):
             return (
                 f"Policy routing priority {_rule_pref(line)} is occupied by another client. "
                 "Disable the other VPN before connecting."
@@ -273,7 +306,7 @@ def remove_owned_leftovers(session: NetSession) -> list[str]:
         owned = [
             _rule_pref(line)
             for line in res.stdout.splitlines()
-            if _rule_pref(line) in session.ip_rules
+            if _rule_pref(line) in session.ip_rules and is_own_rule(line)
         ]
         for pref in owned:
             del_res = _run(["ip", family, "rule", "del", "pref", str(pref)])
@@ -311,13 +344,41 @@ def remove_owned_leftovers(session: NetSession) -> list[str]:
     return failed
 
 
+def _own_leftovers_present() -> bool:
+    if interface_exists(IFACE_NAME):
+        return True
+    if any(is_own_rule(line) for line in _ip_lines("rule", "show")):
+        return True
+    return bool(_ip_lines("route", "show", "table", str(ROUTE_TABLE)))
+
+
+def _reconcile_without_journal() -> str | None:
+    """Journal lost (deleted, disk error) but our namespace is still populated."""
+    if not _own_leftovers_present():
+        return None
+    # A sing-box still holding our interface may be a live instance of this app; leave it.
+    own_config = str(active_config_path())
+    for pid in find_singbox_pids():
+        if own_config in proc_cmdline(pid):
+            return None
+    net_log("found leftovers in our namespace without a journal, removing them")
+    session = NetSession(session_id="orphan", owner_pid=0, interface=IFACE_NAME)
+    session.ip_rules = [
+        _rule_pref(line) for line in _ip_lines("rule", "show") if is_own_rule(line)
+    ]
+    failed = remove_owned_leftovers(session)
+    if failed:
+        return "Leftovers from a previous VPN session could not be removed: " + ", ".join(failed)
+    return None
+
+
 def reconcile_stale_session() -> str | None:
     """Clean leftovers of a previous session whose owner died. Returns a warning, or None."""
     session = read_journal()
     if session is None:
-        return None
+        return _reconcile_without_journal()
 
-    if session.owner_pid != os.getpid() and pid_alive(session.owner_pid):
+    if session.owner_pid != os.getpid() and session.owner_alive():
         # Another live instance of this app owns the session; do not touch it.
         return None
 

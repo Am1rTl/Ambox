@@ -48,6 +48,7 @@ def test_cleanup_only_deletes_owned_rules(monkeypatch, tmp_path):
         "9000:\tfrom all to 172.18.0.0/30 lookup 2022\n"
         "9100:\tfrom all lookup 2090 suppress_prefixlength 0\n"
         "9110:\tfrom all nop\n"
+        "9105:\tfrom all lookup 2022\n"
         "32766:\tfrom all lookup main\n"
     )
 
@@ -70,3 +71,30 @@ def test_diff_snapshots():
     before = {"links": ["lo"], "rules": ["a"], "routes": []}
     after = {"links": ["lo", "x"], "rules": ["a"], "routes": []}
     assert ns.diff_snapshots(before, after) == {"links": {"added": ["x"], "removed": []}}
+
+
+def test_is_own_rule_recognises_singbox_rules_without_iface_name():
+    assert ns.is_own_rule("9100:\tfrom all lookup 2090 suppress_prefixlength 0")
+    assert ns.is_own_rule("9101:\tfrom all lookup main suppress_prefixlength 0")
+    assert ns.is_own_rule("9102:\tnot from all goto 9110")
+    assert ns.is_own_rule("9110:\tfrom all nop")
+    assert not ns.is_own_rule("9105:\tfrom all lookup 2022")
+    assert not ns.is_own_rule("9000:\tfrom all lookup 2090")
+
+
+def test_own_leftover_rule_is_not_reported_as_foreign_vpn(monkeypatch):
+    monkeypatch.setattr(ns, "find_singbox_pids", lambda: [])
+    monkeypatch.setattr(ns, "foreign_default_tun", lambda: [])
+    monkeypatch.setattr(ns, "_ip_lines", lambda *a: ["9100:\tfrom all lookup 2090"])
+    assert ns.detect_foreign_vpn(set()) is None
+    monkeypatch.setattr(ns, "_ip_lines", lambda *a: ["9100:\tfrom all lookup 2022"])
+    assert "occupied" in ns.detect_foreign_vpn(set())
+
+
+def test_reused_owner_pid_is_not_alive(monkeypatch, tmp_path):
+    s = ns.NetSession.new(tmp_path / "c.json")
+    s.owner_starttime = 100
+    monkeypatch.setattr(ns, "proc_starttime", lambda pid: 200)
+    assert not s.owner_alive()
+    monkeypatch.setattr(ns, "proc_starttime", lambda pid: 100)
+    assert s.owner_alive()
