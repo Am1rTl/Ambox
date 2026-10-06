@@ -88,6 +88,10 @@ def profiles_path() -> Path:
     return ensure_app_data_dir() / "profiles.json"
 
 
+def subscriptions_path() -> Path:
+    return ensure_app_data_dir() / "subscriptions.json"
+
+
 def singbox_cache_path() -> Path:
     return ensure_app_data_dir() / "cache.db"
 

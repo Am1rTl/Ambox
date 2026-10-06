@@ -6,11 +6,12 @@ import os
 import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
 from urllib.parse import unquote
 
-from PySide6.QtCore import QSettings, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QSettings, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -41,13 +42,26 @@ from PySide6.QtWidgets import (
 
 from app.app_paths import ensure_user_owned, import_configs_dir, log_path, profiles_path, settings_path
 from app.toast import ToastNotification
-from app.config_parser import ConfigError, Profile, RoutingOptions, load_profiles, load_profiles_from_text, parse_domains_text
-from app.latency import profile_latency_ms
+from app.config_parser import ConfigError, Profile, RoutingOptions, load_happ_link, load_profiles, load_profiles_from_text, parse_domains_text
+from app.happ_links import is_happ_link
+from app.latency import profile_latency_ms, probe_active_connection
+from app.locations import detect_location, iso_to_flag
+from app.subscriptions import (
+    Subscription,
+    SubscriptionStore,
+    derive_subscription_name,
+    fetch_subscription_profiles,
+    generate_subscription_id,
+    is_likely_subscription_url,
+)
+from app.subscriptions_dialog import SubscriptionsDialog
+from app.net_session import IFACE_NAME
 from app.vpn_manager import VpnManager
 
 
 class ProfileListWidget(QListWidget):
     files_dropped = Signal(list)
+    links_dropped = Signal(list)
     items_reordered = Signal(int, int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -79,14 +93,21 @@ class ProfileListWidget(QListWidget):
     def dropEvent(self, event) -> None:  # type: ignore[override]
         if event.mimeData().hasUrls():
             paths = []
+            links = []
             for url in event.mimeData().urls():
-                if not url.isLocalFile():
-                    continue
-                local_path = url.toLocalFile()
-                if local_path:
-                    paths.append(local_path)
+                if url.isLocalFile():
+                    local_path = url.toLocalFile()
+                    if local_path:
+                        paths.append(local_path)
+                elif url.scheme().lower() in {"happ", "http", "https"}:
+                    link = url.toString()
+                    if link:
+                        links.append(link)
             if paths:
                 self.files_dropped.emit(paths)
+            if links:
+                self.links_dropped.emit(links)
+            if paths or links:
                 event.acceptProposedAction()
                 return
 
@@ -100,8 +121,10 @@ class ProfileListWidget(QListWidget):
 
 class MainWindow(QMainWindow):
     latencies_ready = Signal(int, list)
+    happ_import_finished = Signal(str, object, str)
+    subscription_update_finished = Signal(str, object, object, str)
 
-    def __init__(self) -> None:
+    def __init__(self, initial_link: str | None = None) -> None:
         super().__init__()
         self.setWindowTitle("ambox")
         self.resize(430, 820)
@@ -129,6 +152,10 @@ class MainWindow(QMainWindow):
         self._last_used_store: dict[str, float] = {}
         self._last_vpn_status = "disconnected"
 
+        self.subscription_store = SubscriptionStore()
+        self._selected_location = "ALL"
+        self._subs_dialog: SubscriptionsDialog | None = None
+
         self.vpn = VpnManager()
         self.settings = QSettings(str(settings_path()), QSettings.IniFormat)
         ensure_user_owned(settings_path())
@@ -142,6 +169,10 @@ class MainWindow(QMainWindow):
         self._set_status("disconnected")
         self.vpn.refresh_singbox_availability()
         self._warn_if_not_running_as_sudo()
+        startup_warning = self.vpn.take_startup_warning()
+        if startup_warning:
+            self.logs.append(f"WARNING: {startup_warning}")
+            logging.warning(startup_warning)
 
         self.latency_timer = QTimer(self)
         self.latency_timer.setInterval(10000)
@@ -157,6 +188,12 @@ class MainWindow(QMainWindow):
         self.traffic_timer.setInterval(1000)
         self.traffic_timer.timeout.connect(self._on_traffic_tick)
         self.traffic_timer.start()
+
+        if self.settings.value("auto_update_subs", True, type=bool):
+            QTimer.singleShot(1500, self._auto_update_subscriptions_startup)
+
+        if initial_link and (is_happ_link(initial_link) or is_likely_subscription_url(initial_link)):
+            QTimer.singleShot(0, lambda link=initial_link: self._start_happ_import(link, "startup"))
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -280,9 +317,36 @@ class MainWindow(QMainWindow):
         self.profile_sort_combo.addItem("Manual order", "manual")
         self.profile_sort_combo.addItem("Name", "name")
         self.profile_sort_combo.addItem("Latency", "latency")
+        self.profile_sort_combo.addItem("Location", "location")
         self.profile_sort_combo.addItem("Recently used", "recent")
         profile_tools.addWidget(self.profile_sort_combo)
         profiles_layout.addLayout(profile_tools)
+
+        profile_filters = QHBoxLayout()
+        profile_filters.setSpacing(8)
+
+        self.profile_location_combo = QComboBox()
+        self.profile_location_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.profile_location_combo.setMinimumContentsLength(14)
+        self.profile_location_combo.addItem("🌍 All locations", "ALL")
+        profile_filters.addWidget(self.profile_location_combo, 1)
+
+        self.ping_btn = QPushButton("⚡ Ping")
+        self.ping_btn.setToolTip("Test latency of all profiles in parallel (Ctrl+P)")
+        self.ping_btn.clicked.connect(self.refresh_latencies)
+        profile_filters.addWidget(self.ping_btn)
+
+        self.update_subs_btn = QPushButton("🔄 Update")
+        self.update_subs_btn.setToolTip("Update all subscriptions (Ctrl+U)")
+        self.update_subs_btn.clicked.connect(lambda: self.update_all_subscriptions(silent=False))
+        profile_filters.addWidget(self.update_subs_btn)
+
+        self.manage_subs_btn = QPushButton("📋 Subscriptions")
+        self.manage_subs_btn.setToolTip("Manage subscriptions")
+        self.manage_subs_btn.clicked.connect(self.show_subscriptions_dialog)
+        profile_filters.addWidget(self.manage_subs_btn)
+
+        profiles_layout.addLayout(profile_filters)
 
         self.profile_list = ProfileListWidget()
         self.profile_list.setObjectName("profiles")
@@ -342,8 +406,11 @@ class MainWindow(QMainWindow):
         perf_label = QLabel("Performance")
         perf_label.setObjectName("fieldLabel")
         self.auto_switch_checkbox = QCheckBox("Auto switch to lowest latency")
+        self.auto_update_subs_checkbox = QCheckBox("Auto-update subscriptions on startup")
+        self.auto_update_subs_checkbox.setChecked(True)
         perf_layout.addWidget(perf_label)
         perf_layout.addWidget(self.auto_switch_checkbox)
+        perf_layout.addWidget(self.auto_update_subs_checkbox)
 
         timeout_host = QWidget()
         timeout_row = QHBoxLayout(timeout_host)
@@ -764,7 +831,10 @@ class MainWindow(QMainWindow):
             suffix = "timeout" if latency is None else f"{latency} ms"
         usage = self.profile_usage_bytes[index] if index < len(self.profile_usage_bytes) else 0
         connected = "[Connected] " if self.connected_index == index and self.vpn.status in {"connected", "connecting"} else ""
-        return f"{connected}{profile.name}  [{suffix} | {self._format_bytes(usage)}]"
+        srv = str(profile.outbound.get("server") or "")
+        loc = detect_location(profile.name, srv)
+        flag_prefix = f"{loc.flag} " if loc.flag and loc.flag not in profile.name else ""
+        return f"{connected}{flag_prefix}{profile.name}  [{suffix} | {self._format_bytes(usage)}]"
 
     def _profile_usage_key(self, profile: Profile) -> str:
         try:
@@ -787,7 +857,7 @@ class MainWindow(QMainWindow):
             return f"{int(size)} {unit}"
         return f"{size:.1f} {unit}"
 
-    def _read_interface_counters(self, interface: str = "sb-tun") -> tuple[int, int] | None:
+    def _read_interface_counters(self, interface: str = IFACE_NAME) -> tuple[int, int] | None:
         base = Path("/sys/class/net") / interface / "statistics"
         try:
             rx_text = (base / "rx_bytes").read_text(encoding="utf-8").strip()
@@ -836,6 +906,16 @@ class MainWindow(QMainWindow):
         if search_text:
             indices = [idx for idx in indices if search_text in self.profiles[idx].name.lower()]
 
+        if self._selected_location != "ALL":
+            filtered = []
+            for idx in indices:
+                p = self.profiles[idx]
+                srv = str(p.outbound.get("server") or "")
+                loc = detect_location(p.name, srv)
+                if loc.code == self._selected_location:
+                    filtered.append(idx)
+            indices = filtered
+
         sort_mode = str(self.profile_sort_combo.currentData() or "manual")
         if sort_mode == "name":
             indices.sort(key=lambda idx: self.profiles[idx].name.lower())
@@ -844,6 +924,13 @@ class MainWindow(QMainWindow):
                 key=lambda idx: (
                     self.profile_latencies[idx] is None,
                     self.profile_latencies[idx] if self.profile_latencies[idx] is not None else 10**9,
+                    self.profiles[idx].name.lower(),
+                )
+            )
+        elif sort_mode == "location":
+            indices.sort(
+                key=lambda idx: (
+                    detect_location(self.profiles[idx].name, str(self.profiles[idx].outbound.get("server") or "")).name,
                     self.profiles[idx].name.lower(),
                 )
             )
@@ -866,7 +953,7 @@ class MainWindow(QMainWindow):
 
     def _update_profile_list_capabilities(self) -> None:
         manual_mode = str(self.profile_sort_combo.currentData() or "manual") == "manual"
-        drag_enabled = manual_mode and not self.profile_search_edit.text().strip()
+        drag_enabled = manual_mode and not self.profile_search_edit.text().strip() and self._selected_location == "ALL"
         self.profile_list.setDragEnabled(drag_enabled)
         self.profile_list.setDragDropMode(QAbstractItemView.InternalMove if drag_enabled else QAbstractItemView.NoDragDrop)
         if drag_enabled:
@@ -875,7 +962,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self.profile_list_hint.setText(
-                "Right click for actions. Drag reorder is available only in manual order with empty search. Drop files here to import."
+                "Right click for actions. Drag reorder is available only in manual order without filters. Drop files here to import."
             )
 
     def _rebuild_profile_list(self, preserve_selection: bool = True) -> None:
@@ -887,8 +974,15 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(self._profile_item_text(profile_index))
             item.setData(Qt.UserRole, profile_index)
             profile = self.profiles[profile_index]
+            srv = str(profile.outbound.get("server") or "")
+            loc = detect_location(profile.name, srv)
             latency = self.profile_latencies[profile_index] if profile_index < len(self.profile_latencies) else None
             tooltip = [profile.name]
+            tooltip.append(f"Location: {loc.flag} {loc.name} ({loc.code})")
+            if profile.subscription_id:
+                sub = self.subscription_store.get(profile.subscription_id)
+                if sub:
+                    tooltip.append(f"Subscription: {sub.name}")
             tooltip.append(f"Latency: {'timeout' if latency is None else f'{latency} ms'}")
             tooltip.append(f"Traffic: {self._format_bytes(self.profile_usage_bytes[profile_index])}")
             last_used = self._profile_last_used_timestamp(profile_index)
@@ -929,7 +1023,44 @@ class MainWindow(QMainWindow):
         self.quick_profile_frame.setVisible(len(labels) > 1)
         self.quick_profile_combo.setEnabled(len(labels) > 1)
 
+    def _refresh_location_filter(self) -> None:
+        counts: dict[str, tuple[str, str, int]] = {}
+        for profile in self.profiles:
+            srv = str(profile.outbound.get("server") or "")
+            loc = detect_location(profile.name, srv)
+            if loc.code not in counts:
+                counts[loc.code] = (loc.flag, loc.name, 1)
+            else:
+                flag, name, c = counts[loc.code]
+                counts[loc.code] = (flag, name, c + 1)
+
+        self.profile_location_combo.blockSignals(True)
+        self.profile_location_combo.clear()
+        self.profile_location_combo.addItem(f"🌍 All locations ({len(self.profiles)})", "ALL")
+
+        sorted_locs = sorted(counts.items(), key=lambda item: (-item[1][2], item[1][1]))
+        target_index = 0
+        for i, (code, (flag, name, count)) in enumerate(sorted_locs, start=1):
+            self.profile_location_combo.addItem(f"{flag} {name} ({count})", code)
+            if code == self._selected_location:
+                target_index = i
+
+        if target_index >= self.profile_location_combo.count():
+            target_index = 0
+            self._selected_location = "ALL"
+        self.profile_location_combo.setCurrentIndex(target_index)
+        self.profile_location_combo.blockSignals(False)
+
+    def _on_location_combo_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        code = self.profile_location_combo.currentData()
+        if code is not None and str(code) != self._selected_location:
+            self._selected_location = str(code)
+            self._rebuild_profile_list(preserve_selection=True)
+
     def _refresh_profile_views(self, preserve_selection: bool = True) -> None:
+        self._refresh_location_filter()
         self._rebuild_profile_list(preserve_selection=preserve_selection)
         self._sync_quick_profile_selector()
         self._refresh_latency_update_labels()
@@ -973,9 +1104,29 @@ class MainWindow(QMainWindow):
         install_action.triggered.connect(self.install_singbox)
         menu.addAction(install_action)
 
+        ping_action = QAction("Test ping (all profiles)", self)
+        ping_action.setShortcut(QKeySequence("Ctrl+P"))
+        ping_action.triggered.connect(self.refresh_latencies)
+        menu.addAction(ping_action)
+
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.close)
         menu.addAction(quit_action)
+
+        sub_menu = self.menuBar().addMenu("Subscriptions")
+
+        update_subs_action = QAction("Update all subscriptions", self)
+        update_subs_action.setShortcut(QKeySequence("Ctrl+U"))
+        update_subs_action.triggered.connect(lambda: self.update_all_subscriptions(silent=False))
+        sub_menu.addAction(update_subs_action)
+
+        manage_subs_action = QAction("Manage subscriptions...", self)
+        manage_subs_action.triggered.connect(self.show_subscriptions_dialog)
+        sub_menu.addAction(manage_subs_action)
+
+        add_sub_action = QAction("Add subscription...", self)
+        add_sub_action.triggered.connect(self.add_subscription_dialog)
+        sub_menu.addAction(add_sub_action)
 
     def _connect_signals(self) -> None:
         self.vpn.status_changed.connect(self._on_vpn_status_changed)
@@ -988,14 +1139,21 @@ class MainWindow(QMainWindow):
         self.profile_list.customContextMenuRequested.connect(self._show_profile_context_menu)
         self.profile_list.itemDoubleClicked.connect(lambda _item: self._connect_selected_profile())
         self.profile_list.files_dropped.connect(self._import_dropped_files)
+        self.profile_list.links_dropped.connect(self._import_dropped_links)
         self.profile_list.items_reordered.connect(self._on_profile_items_reordered)
+        self.happ_import_finished.connect(self._on_happ_import_finished)
+        self.subscription_update_finished.connect(self._on_subscription_update_finished)
         self.quick_profile_combo.currentIndexChanged.connect(self._on_quick_profile_changed)
         self.profile_search_edit.textChanged.connect(self._on_profile_filter_changed)
         self.profile_sort_combo.currentIndexChanged.connect(self._on_profile_filter_changed)
+        self.profile_location_combo.currentIndexChanged.connect(self._on_location_combo_changed)
         self.copy_logs_btn.clicked.connect(self.copy_logs)
         self.clear_logs_btn.clicked.connect(self.clear_logs)
         self.open_log_file_btn.clicked.connect(self.open_log_file)
         self.auto_switch_checkbox.toggled.connect(lambda checked: self.settings.setValue("auto_switch", checked))
+        self.auto_update_subs_checkbox.toggled.connect(
+            lambda checked: self.settings.setValue("auto_update_subs", checked)
+        )
         self.timeout_spin.valueChanged.connect(lambda value: self.settings.setValue("timeout_ms", value))
         self.route_mode_combo.currentIndexChanged.connect(self._on_route_mode_changed)
         self.dns_mode_combo.currentIndexChanged.connect(self._on_dns_mode_changed)
@@ -1012,6 +1170,7 @@ class MainWindow(QMainWindow):
 
     def _restore_settings(self) -> None:
         auto_switch = self.settings.value("auto_switch", False, type=bool)
+        auto_update_subs = self.settings.value("auto_update_subs", True, type=bool)
         timeout_ms = self.settings.value("timeout_ms", 1200, type=int)
         route_mode = self.settings.value("route_mode", "all", type=str) or "all"
         route_dns_mode = self.settings.value("route_dns_mode", "", type=str) or ""
@@ -1042,6 +1201,7 @@ class MainWindow(QMainWindow):
             self._last_used_store = {}
 
         self.auto_switch_checkbox.setChecked(auto_switch)
+        self.auto_update_subs_checkbox.setChecked(auto_update_subs)
         self.timeout_spin.setValue(timeout_ms)
         route_index = self.route_mode_combo.findData(route_mode)
         if route_index < 0:
@@ -1082,7 +1242,13 @@ class MainWindow(QMainWindow):
             outbound = item.get("outbound")
             if not isinstance(name, str) or not isinstance(outbound, dict):
                 continue
-            loaded.append(Profile(name=name or f"Profile {idx}", outbound=outbound))
+            loaded.append(
+                Profile(
+                    name=name or f"Profile {idx}",
+                    outbound=outbound,
+                    subscription_id=item.get("subscription_id"),
+                )
+            )
 
         if loaded:
             self._apply_loaded_profiles(loaded, persist=False)
@@ -1106,7 +1272,11 @@ class MainWindow(QMainWindow):
     def _save_profiles(self) -> None:
         payload = {
             "profiles": [
-                {"name": profile.name, "outbound": profile.outbound}
+                {
+                    "name": profile.name,
+                    "outbound": profile.outbound,
+                    "subscription_id": profile.subscription_id,
+                }
                 for profile in self.profiles
             ]
         }
@@ -1205,12 +1375,266 @@ class MainWindow(QMainWindow):
             return
         self._load_profiles_from_paths(candidates, "drag-and-drop")
 
+    def _import_dropped_links(self, links: list[str]) -> None:
+        for link in links:
+            if is_happ_link(link) or is_likely_subscription_url(link):
+                self._start_happ_import(link, "drag-and-drop")
+
+    def _start_happ_import(self, link: str, source_label: str, custom_name: str = "") -> None:
+        link = link.strip()
+        if not link:
+            return
+        # Extract clean URL if surrounding text or non-ASCII characters got attached
+        match = re.search(r"(happ://[^\s\"<>]+|https?://[A-Za-z0-9_.~:/?#\[\]@!$&()*+,;=-]+)", link)
+        if match:
+            link = match.group(1).rstrip("\"';,.<>")
+
+        self._append_log(f"Importing subscription / Happ link from {source_label}")
+        worker = threading.Thread(
+            target=self._happ_import_worker,
+            args=(link, source_label, custom_name),
+            daemon=True,
+        )
+        worker.start()
+
+    def _happ_import_worker(self, link: str, source_label: str, custom_name: str = "") -> None:
+        try:
+            profiles, target_url, headers_info = fetch_subscription_profiles(link)
+            sub_id = generate_subscription_id(target_url or link)
+            sub_name = custom_name.strip() if custom_name else derive_subscription_name(target_url or link, headers_info)
+            for p in profiles:
+                p.subscription_id = sub_id
+            meta = {
+                "sub_id": sub_id,
+                "name": sub_name,
+                "url": target_url,
+                "original_link": link,
+                "headers_info": headers_info,
+            }
+            self.happ_import_finished.emit(source_label, (profiles, meta), "")
+        except Exception as exc:
+            self.happ_import_finished.emit(source_label, [], str(exc))
+
+    def _on_happ_import_finished(self, source_label: str, loaded: object, error: str) -> None:
+        if error:
+            self._show_error(f"Failed to import from {source_label}: {error}")
+            return
+
+        profiles: list[Profile] = []
+        meta: dict[str, Any] = {}
+        if isinstance(loaded, tuple) and len(loaded) == 2:
+            profiles = [p for p in loaded[0] if isinstance(p, Profile)]
+            meta = dict(loaded[1]) if isinstance(loaded[1], dict) else {}
+        elif isinstance(loaded, list):
+            profiles = [p for p in loaded if isinstance(p, Profile)]
+
+        if not profiles:
+            self._show_error("Link did not contain any usable profiles")
+            return
+
+        sub_id = meta.get("sub_id")
+        if sub_id:
+            sub = Subscription(
+                id=sub_id,
+                name=meta.get("name", "Subscription"),
+                url=meta.get("url", ""),
+                original_link=meta.get("original_link", ""),
+                updated_at=time.time(),
+                profile_count=len(profiles),
+                user_info=meta.get("headers_info", {}).get("user_info", {}) if isinstance(meta.get("headers_info"), dict) else {},
+            )
+            self.subscription_store.put(sub)
+            self._apply_updated_subscription_profiles(sub_id, profiles)
+        else:
+            self._apply_loaded_profiles(profiles)
+
+        if self._subs_dialog and self._subs_dialog.isVisible():
+            self._subs_dialog.refresh_list()
+
+        self._append_log(f"Imported {len(profiles)} profile(s) from {source_label}")
+        self._notify_user("Profiles imported", f"Imported {len(profiles)} profile(s)")
+
+    def _auto_update_subscriptions_startup(self) -> None:
+        if not self.auto_update_subs_checkbox.isChecked():
+            return
+        subs = self.subscription_store.all()
+        if subs:
+            self._append_log(f"Auto-updating {len(subs)} subscription(s) on startup...")
+            self.update_all_subscriptions(silent=True)
+
+    def show_subscriptions_dialog(self) -> None:
+        if self._subs_dialog is None:
+            self._subs_dialog = SubscriptionsDialog(self)
+            self._subs_dialog.update_single_signal.connect(self.update_subscription)
+            self._subs_dialog.update_all_signal.connect(self.update_all_subscriptions)
+            self._subs_dialog.add_subscription_signal.connect(self._add_subscription_from_dialog)
+            self._subs_dialog.delete_subscription_signal.connect(self.delete_subscription)
+        self._subs_dialog.refresh_list()
+        self._subs_dialog.show()
+        self._subs_dialog.raise_()
+        self._subs_dialog.activateWindow()
+
+    def add_subscription_dialog(self) -> None:
+        url, ok = QInputDialog.getText(
+            self,
+            "Add subscription",
+            "Enter Happ link or HTTPS subscription URL:",
+        )
+        if ok and url.strip():
+            self._start_happ_import(url.strip(), "dialog")
+
+    def _add_subscription_from_dialog(self, url: str, name: str) -> None:
+        self._start_happ_import(url, "dialog", custom_name=name)
+
+    def update_subscription(self, sub_id: str) -> None:
+        sub = self.subscription_store.get(sub_id)
+        if not sub:
+            self._show_error("Subscription not found")
+            return
+        self._append_log(f"Updating subscription: {sub.name}")
+        worker = threading.Thread(
+            target=self._subscription_update_worker,
+            args=(sub.id, sub.original_link or sub.url, sub.name),
+            daemon=True,
+        )
+        worker.start()
+
+    def update_all_subscriptions(self, silent: bool = False) -> None:
+        subs = self.subscription_store.all()
+        if not subs:
+            if not silent:
+                self._notify_user("Subscriptions", "No subscriptions configured")
+            return
+        self._append_log(f"Updating all {len(subs)} subscription(s)...")
+        for sub in subs:
+            worker = threading.Thread(
+                target=self._subscription_update_worker,
+                args=(sub.id, sub.original_link or sub.url, sub.name),
+                daemon=True,
+            )
+            worker.start()
+
+    def _subscription_update_worker(self, sub_id: str, url: str, name: str) -> None:
+        try:
+            profiles, target_url, headers_info = fetch_subscription_profiles(url)
+            self.subscription_update_finished.emit(sub_id, profiles, headers_info, "")
+        except Exception as exc:
+            self.subscription_update_finished.emit(sub_id, [], {}, str(exc))
+
+    def _on_subscription_update_finished(self, sub_id: str, profiles: object, headers_info: object, error: str) -> None:
+        sub = self.subscription_store.get(sub_id)
+        sub_name = sub.name if sub else sub_id
+        if error:
+            self._append_log(f"Failed to update subscription '{sub_name}': {error}")
+            self._show_error(f"Subscription update failed ({sub_name}): {error}")
+            return
+        if not isinstance(profiles, list) or not profiles:
+            self._append_log(f"Subscription '{sub_name}' returned no profiles")
+            self._show_error(f"Subscription '{sub_name}' returned no profiles")
+            return
+
+        loaded_profiles = [p for p in profiles if isinstance(p, Profile)]
+        if sub:
+            sub.updated_at = time.time()
+            sub.profile_count = len(loaded_profiles)
+            if isinstance(headers_info, dict) and "user_info" in headers_info:
+                sub.user_info = headers_info["user_info"]
+            self.subscription_store.put(sub)
+
+        self._apply_updated_subscription_profiles(sub_id, loaded_profiles)
+        self._append_log(f"Updated subscription '{sub_name}': {len(loaded_profiles)} profile(s)")
+        self._notify_user("Subscription updated", f"{sub_name}: {len(loaded_profiles)} profiles loaded")
+        if self._subs_dialog and self._subs_dialog.isVisible():
+            self._subs_dialog.refresh_list()
+
+    def delete_subscription(self, sub_id: str) -> None:
+        sub = self.subscription_store.get(sub_id)
+        if not sub:
+            return
+        indices_to_remove = [i for i, p in enumerate(self.profiles) if p.subscription_id == sub_id]
+        if self.connected_index in indices_to_remove:
+            self.vpn.disconnect()
+            self.connected_index = None
+
+        self.profiles = [p for i, p in enumerate(self.profiles) if i not in indices_to_remove]
+        self.profile_latencies = [l for i, l in enumerate(self.profile_latencies) if i not in indices_to_remove]
+        self.profile_usage_bytes = [u for i, u in enumerate(self.profile_usage_bytes) if i not in indices_to_remove]
+
+        self.subscription_store.remove(sub_id)
+        self._pending_latency_indices = set(range(len(self.profiles)))
+        self._save_profiles()
+        self._refresh_location_filter()
+        self._refresh_profile_views()
+        self._notify_user("Subscription deleted", f'Removed subscription "{sub.name}"')
+        self._append_log(f'Deleted subscription "{sub.name}" and {len(indices_to_remove)} profile(s)')
+
+    def _apply_updated_subscription_profiles(self, sub_id: str, new_profiles: list[Profile]) -> None:
+        if not new_profiles:
+            return
+
+        connected_profile = self.profiles[self.connected_index] if self.connected_index is not None and self.connected_index < len(self.profiles) else None
+        connected_key = self._profile_usage_key(connected_profile) if connected_profile else None
+
+        new_list_profiles: list[Profile] = []
+        new_list_latencies: list[int | None] = []
+        new_list_usage: list[int] = []
+
+        replaced = False
+        for i, p in enumerate(self.profiles):
+            if p.subscription_id == sub_id:
+                if not replaced:
+                    for np in new_profiles:
+                        np.subscription_id = sub_id
+                        new_list_profiles.append(np)
+                        new_list_latencies.append(None)
+                        usage = int(self._usage_store.get(self._profile_usage_key(np), 0))
+                        new_list_usage.append(usage)
+                    replaced = True
+            else:
+                new_list_profiles.append(p)
+                new_list_latencies.append(self.profile_latencies[i] if i < len(self.profile_latencies) else None)
+                new_list_usage.append(self.profile_usage_bytes[i] if i < len(self.profile_usage_bytes) else 0)
+
+        if not replaced:
+            for np in new_profiles:
+                np.subscription_id = sub_id
+                new_list_profiles.append(np)
+                new_list_latencies.append(None)
+                usage = int(self._usage_store.get(self._profile_usage_key(np), 0))
+                new_list_usage.append(usage)
+
+        self.profiles = new_list_profiles
+        self.profile_latencies = new_list_latencies
+        self.profile_usage_bytes = new_list_usage
+
+        if connected_key is not None:
+            new_connected_idx = None
+            for idx, p in enumerate(self.profiles):
+                if self._profile_usage_key(p) == connected_key:
+                    new_connected_idx = idx
+                    break
+            self.connected_index = new_connected_idx
+
+        self._pending_latency_indices = set(range(len(self.profiles)))
+        self._save_profiles()
+        self._refresh_location_filter()
+        self._refresh_profile_views()
+        self.refresh_latencies()
+
     def import_from_clipboard(self) -> None:
         clipboard = QApplication.clipboard()
         text = clipboard.text().strip()
         if not text:
             self._show_error("Clipboard is empty")
             return
+
+        # Check if the text contains a Happ or subscription URL
+        url_match = re.search(r"(happ://[^\s\"<>]+|https?://[A-Za-z0-9_.~:/?#\[\]@!$&()*+,;=-]+)", text)
+        if url_match:
+            candidate = url_match.group(1).rstrip("\"';,.<>")
+            if is_happ_link(candidate) or is_likely_subscription_url(candidate):
+                self._start_happ_import(candidate, "clipboard")
+                return
 
         maybe_path = text
         if text.startswith("file://"):
@@ -1223,7 +1647,7 @@ class MainWindow(QMainWindow):
             except (OSError, ValueError, ConfigError):
                 self._show_error(
                     "Clipboard contains a file path, but this file is not a valid text VPN config. "
-                    "Copy a vless/vmess/trojan/ss link or a JSON config."
+                    "Copy a vless/vmess/trojan/ss link, a Happ add link, or a JSON config."
                 )
                 return
             self._apply_loaded_profiles(loaded)
@@ -1271,6 +1695,12 @@ class MainWindow(QMainWindow):
                 self.connected_index = None
             elif self.connected_index > index:
                 self.connected_index -= 1
+
+        if profile.subscription_id:
+            sub = self.subscription_store.get(profile.subscription_id)
+            if sub and sub.profile_count > 0:
+                sub.profile_count -= 1
+                self.subscription_store.put(sub)
 
         self._usage_store.pop(self._profile_usage_key(profile), None)
         self._last_used_store.pop(self._profile_last_used_key(profile), None)
@@ -1335,6 +1765,7 @@ class MainWindow(QMainWindow):
         duplicate = Profile(
             name=self._unique_profile_name(f"{source.name} copy"),
             outbound=deepcopy(source.outbound),
+            subscription_id=None,
         )
         insert_at = index + 1
         self.profiles.insert(insert_at, duplicate)
@@ -1398,6 +1829,11 @@ class MainWindow(QMainWindow):
         profile = self.profiles[profile_index]
 
         connect_action = menu.addAction("Connect")
+        update_sub_action = None
+        if profile.subscription_id:
+            sub = self.subscription_store.get(profile.subscription_id)
+            if sub:
+                update_sub_action = menu.addAction(f'Update subscription "{sub.name}"')
         rename_action = menu.addAction("Rename")
         duplicate_action = menu.addAction("Duplicate")
         export_action = menu.addAction("Export")
@@ -1407,6 +1843,9 @@ class MainWindow(QMainWindow):
         selected_action = menu.exec(self.profile_list.viewport().mapToGlobal(pos))
         if selected_action is connect_action:
             self._connect_profile(profile_index)
+        elif update_sub_action and selected_action is update_sub_action:
+            if profile.subscription_id:
+                self.update_subscription(profile.subscription_id)
         elif selected_action is rename_action:
             self.rename_selected_profile()
         elif selected_action is duplicate_action:
@@ -1586,8 +2025,21 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _scan_latency_worker(self, scan_id: int, profiles: list[Profile], timeout_sec: float) -> None:
-        results = [profile_latency_ms(profile, timeout_sec) for profile in profiles]
+        workers = min(24, max(4, len(profiles)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            results = list(executor.map(lambda p: profile_latency_ms(p, timeout_sec), profiles))
         self.latencies_ready.emit(scan_id, results)
+
+        if self.vpn.status == "connected":
+            res = probe_active_connection(timeout_sec=3.5)
+            if res and res.get("ok"):
+                ip = res.get("ip")
+                loc = res.get("loc")
+                latency = res.get("latency_ms")
+                info = f"{latency} ms"
+                if ip and loc:
+                    info += f" | IP: {ip} ({loc})"
+                self._append_log(f"[Probe] Active VPN latency verified: {info}")
 
     def _on_latencies_ready(self, scan_id: int, latencies: list[int | None]) -> None:
         if scan_id != self._active_scan_id:
@@ -1612,7 +2064,16 @@ class MainWindow(QMainWindow):
         best_index: int | None = None
         best_latency: int | None = None
 
-        for idx, latency in enumerate(self.profile_latencies):
+        candidate_indices = (
+            self._visible_profile_indices
+            if self._selected_location != "ALL" and self._visible_profile_indices
+            else range(len(self.profiles))
+        )
+
+        for idx in candidate_indices:
+            if idx >= len(self.profile_latencies):
+                continue
+            latency = self.profile_latencies[idx]
             if latency is None:
                 continue
             if best_latency is None or latency < best_latency:
@@ -1700,6 +2161,23 @@ class MainWindow(QMainWindow):
         self._refresh_profile_views()
         self._persist_usage_store()
 
+    def _connection_warmup_worker(self) -> None:
+        time.sleep(0.3)
+        res = probe_active_connection(timeout_sec=4.0)
+        if res and res.get("ok"):
+            ip = res.get("ip")
+            loc = res.get("loc")
+            latency = res.get("latency_ms")
+            info = f"{latency} ms"
+            if ip and loc:
+                info += f" | IP: {ip} ({loc})"
+            self._append_log(f"[Probe] Tunnel warm-up successful: {info}")
+        else:
+            time.sleep(0.8)
+            res2 = probe_active_connection(timeout_sec=4.0)
+            if res2 and res2.get("ok"):
+                self._append_log(f"[Probe] Tunnel verified: {res2.get('latency_ms')} ms")
+
     def _on_vpn_status_changed(self, status: str) -> None:
         previous = self._last_vpn_status
         self._last_vpn_status = status
@@ -1707,6 +2185,7 @@ class MainWindow(QMainWindow):
         self._refresh_profile_views()
         if status == "connected" and self.connected_index is not None:
             ToastNotification("VPN connected", self.profiles[self.connected_index].name, True)
+            threading.Thread(target=self._connection_warmup_worker, daemon=True).start()
         elif status == "disconnected":
             self.connected_index = None
             self._timeout_streak = 0
@@ -1755,6 +2234,15 @@ class MainWindow(QMainWindow):
     def _append_log(self, text: str) -> None:
         self.logs.append(text)
         logging.info(text)
+
+    def event(self, event) -> bool:  # type: ignore[override]
+        if event.type() == QEvent.Type.FileOpen:
+            url = event.url()
+            if url.scheme().lower() in {"happ", "http", "https"}:
+                link = url.toString()
+                QTimer.singleShot(0, lambda value=link: self._start_happ_import(value, "deep link"))
+                return True
+        return super().event(event)
 
     def _show_error(self, message: str) -> None:
         QMessageBox.critical(self, "Error", message)

@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import sys
 import traceback
 
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -62,6 +64,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Enable debug mode with verbose logs and traceback output",
     )
+    parser.add_argument(
+        "link",
+        nargs="?",
+        help="Optional happ:// link to import at startup",
+    )
     return parser.parse_args(argv)
 
 
@@ -92,8 +99,15 @@ def main(argv: list[str] | None = None) -> int:
     app.setPalette(palette)
     app.setStyleSheet("QToolTip { background-color: #1c202b; border: 1px solid #3a3f4d; color: #d9dce3; }")
     _install_excepthook(args.debug)
-    window = MainWindow()
+    window = MainWindow(initial_link=args.link)
     window.show()
+    # SIGTERM/SIGINT: quit through Qt so VpnManager tears down the TUN session cleanly.
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, lambda *_: app.quit())
+    app.aboutToQuit.connect(window.vpn.disconnect)
+    _keepalive = QTimer()  # lets the Python signal handlers run inside the Qt loop
+    _keepalive.start(500)
+    _keepalive.timeout.connect(lambda: None)
     logging.info("Main window initialized")
     return app.exec()
 

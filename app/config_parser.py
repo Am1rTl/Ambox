@@ -3,10 +3,12 @@ import binascii
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
 from app.app_paths import singbox_cache_path
+from app.net_session import IFACE_NAME, ROUTE_TABLE, RULE_INDEX
+from app.happ_links import HappLinkError, fetch_subscription, is_happ_link, unwrap_happ_link
 
 RU_DOMAIN_SUFFIX = ".ru"
 
@@ -15,6 +17,7 @@ RU_DOMAIN_SUFFIX = ".ru"
 class Profile:
     name: str
     outbound: dict[str, Any]
+    subscription_id: str | None = None
 
 
 @dataclass
@@ -48,6 +51,9 @@ def _supports_udp(outbound: dict[str, Any]) -> bool:
     unless packet encoding is explicitly enabled.
     """
     out_type = str(outbound.get("type", "")).lower()
+    if out_type in {"hysteria2", "hy2", "tuic"}:
+        return True
+
     network = str(outbound.get("network", "")).lower()
     packet_encoding = str(outbound.get("packet_encoding", "")).lower()
     transport_type = str((outbound.get("transport") or {}).get("type", "")).lower()
@@ -174,6 +180,7 @@ def _decode_vmess(uri: str) -> Profile:
         "security": "auto",
         "alter_id": 0,
         "network": "tcp",
+        "packet_encoding": "xudp",
     }
     try:
         outbound["alter_id"] = int(data.get("aid", 0))
@@ -219,6 +226,7 @@ def _decode_vless(uri: str) -> Profile:
         "server_port": int(port),
         "uuid": uuid,
         "network": "tcp",
+        "packet_encoding": query.get("packetEncoding", ["xudp"])[0],
     }
     flow = query.get("flow", [""])[0]
     if flow:
@@ -255,6 +263,7 @@ def _decode_trojan(uri: str) -> Profile:
         "server_port": int(port),
         "password": password,
         "network": "tcp",
+        "packet_encoding": "xudp",
     }
 
     security = query.get("security", ["tls"])[0]
@@ -385,6 +394,44 @@ def _decode_socks_proxy(uri: str) -> Profile:
     return Profile(name=name, outbound=outbound)
 
 
+def _decode_hysteria2(uri: str) -> Profile:
+    parsed = urlparse(uri)
+    password = parsed.username or parsed.password or ""
+    server = parsed.hostname
+    if not server:
+        raise ConfigError("hysteria2: missing server")
+    try:
+        port = parsed.port or 443
+    except ValueError as exc:
+        raise ConfigError("hysteria2: invalid port") from exc
+
+    query = parse_qs(parsed.query)
+    name = unquote(parsed.fragment) if parsed.fragment else f"hy2-{server}"
+    sni = query.get("sni", [server])[0]
+    insecure = query.get("insecure", ["0"])[0] in {"1", "true"}
+
+    outbound: dict[str, Any] = {
+        "type": "hysteria2",
+        "tag": "proxy",
+        "server": server,
+        "server_port": int(port),
+        "password": password,
+        "tls": {
+            "enabled": True,
+            "server_name": sni,
+        },
+    }
+    if insecure:
+        outbound["tls"]["insecure"] = True
+
+    obfs_type = query.get("obfs", [""])[0]
+    obfs_password = query.get("obfs-password", [""])[0]
+    if obfs_type and obfs_password:
+        outbound["obfs"] = {"type": obfs_type, "password": obfs_password}
+
+    return Profile(name=name, outbound=outbound)
+
+
 def parse_uri_line(line: str) -> Profile:
     try:
         scheme = urlparse(line).scheme.lower()
@@ -394,9 +441,24 @@ def parse_uri_line(line: str) -> Profile:
             return _decode_vless(line)
         if line.startswith("trojan://"):
             return _decode_trojan(line)
+        if line.startswith("hysteria2://") or line.startswith("hy2://"):
+            return _decode_hysteria2(line)
         if line.startswith("ss://"):
             return _decode_ss(line)
+        if scheme == "happ":
+            try:
+                target = unwrap_happ_link(line)
+            except HappLinkError as exc:
+                raise ConfigError(str(exc)) from exc
+            target_scheme = urlparse(target).scheme.lower()
+            if target_scheme in {"http", "https"}:
+                raise ConfigError("Happ link points to a subscription URL; import it as a subscription")
+            return parse_uri_line(target)
         if scheme in {"http", "https"}:
+            from app.subscriptions import is_likely_subscription_url
+
+            if is_likely_subscription_url(line):
+                raise ConfigError("HTTP(S) link points to a subscription URL; import it as a subscription")
             return _decode_http_proxy(line)
         if scheme in {"socks", "socks5", "socks5h"}:
             return _decode_socks_proxy(line)
@@ -405,6 +467,285 @@ def parse_uri_line(line: str) -> Profile:
         raise
     except Exception as exc:
         raise ConfigError(f"invalid profile link: {line[:24]}...") from exc
+
+
+def xray_to_singbox_outbound(ob: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(ob, dict):
+        return None
+    proto = str(ob.get("protocol") or ob.get("type") or "").lower()
+    if proto in {"freedom", "blackhole", "direct", "block", ""}:
+        return None
+
+    settings = ob.get("settings") or {}
+    stream = ob.get("streamSettings") or {}
+
+    outbound: dict[str, Any] = {"tag": ob.get("tag") or "proxy"}
+    server = ""
+    port = 443
+
+    if proto in {"vless", "vmess"}:
+        vnext = settings.get("vnext") or []
+        if not vnext or not isinstance(vnext, list) or not isinstance(vnext[0], dict):
+            if "server" in ob and "uuid" in ob:
+                # Already in sing-box format
+                outbound = dict(ob)
+                outbound["type"] = proto
+                return outbound
+            return None
+        target = vnext[0]
+        server = target.get("address") or ""
+        try:
+            port = int(target.get("port") or 443)
+        except (ValueError, TypeError):
+            port = 443
+        users = target.get("users") or []
+        if not users or not isinstance(users[0], dict):
+            return None
+        user = users[0]
+        outbound["type"] = proto
+        outbound["server"] = server
+        outbound["server_port"] = port
+        outbound["uuid"] = user.get("id") or ""
+        outbound["packet_encoding"] = "xudp"
+        if proto == "vless" and user.get("flow"):
+            outbound["flow"] = user.get("flow")
+        if proto == "vmess":
+            outbound["security"] = user.get("security") or "auto"
+            try:
+                outbound["alter_id"] = int(user.get("alterId") or 0)
+            except (ValueError, TypeError):
+                outbound["alter_id"] = 0
+    elif proto == "trojan":
+        servers = settings.get("servers") or []
+        if not servers or not isinstance(servers[0], dict):
+            if "server" in ob and "password" in ob:
+                outbound = dict(ob)
+                outbound["type"] = "trojan"
+                outbound["packet_encoding"] = "xudp"
+                return outbound
+            return None
+        target = servers[0]
+        server = target.get("address") or ""
+        try:
+            port = int(target.get("port") or 443)
+        except (ValueError, TypeError):
+            port = 443
+        outbound["type"] = "trojan"
+        outbound["server"] = server
+        outbound["server_port"] = port
+        outbound["password"] = target.get("password") or ""
+        outbound["packet_encoding"] = "xudp"
+    elif proto == "shadowsocks":
+        servers = settings.get("servers") or []
+        if not servers or not isinstance(servers[0], dict):
+            if "server" in ob and "method" in ob:
+                outbound = dict(ob)
+                outbound["type"] = "shadowsocks"
+                return outbound
+            return None
+        target = servers[0]
+        server = target.get("address") or ""
+        try:
+            port = int(target.get("port") or 443)
+        except (ValueError, TypeError):
+            port = 443
+        outbound["type"] = "shadowsocks"
+        outbound["server"] = server
+        outbound["server_port"] = port
+        outbound["method"] = target.get("method") or ""
+        outbound["password"] = target.get("password") or ""
+    elif "server" in ob and ("type" in ob or "protocol" in ob):
+        outbound = dict(ob)
+        outbound["type"] = ob.get("type") or ob.get("protocol")
+        return outbound
+    else:
+        return None
+
+    network = (stream.get("network") or "tcp").lower()
+    outbound["network"] = network if network in {"tcp", "udp"} else "tcp"
+
+    if network in {"ws", "http", "httpupgrade"}:
+        ws_settings = stream.get(f"{network}Settings") or stream.get("wsSettings") or {}
+        transport: dict[str, Any] = {"type": network}
+        if ws_settings.get("path"):
+            transport["path"] = ws_settings["path"]
+        if ws_settings.get("headers"):
+            transport["headers"] = ws_settings["headers"]
+        outbound["transport"] = transport
+    elif network == "grpc":
+        grpc_settings = stream.get("grpcSettings") or {}
+        transport = {"type": "grpc"}
+        if grpc_settings.get("serviceName"):
+            transport["service_name"] = grpc_settings["serviceName"]
+        outbound["transport"] = transport
+
+    security = (stream.get("security") or "").lower()
+    if security in {"tls", "reality"}:
+        sec_settings = stream.get(f"{security}Settings") or stream.get("tlsSettings") or {}
+        server_name = sec_settings.get("serverName") or sec_settings.get("sni") or server
+        tls: dict[str, Any] = {
+            "enabled": True,
+            "server_name": server_name,
+        }
+        if sec_settings.get("allowInsecure"):
+            tls["insecure"] = True
+        fp = sec_settings.get("fingerprint")
+        if fp:
+            tls["utls"] = {"enabled": True, "fingerprint": fp}
+        if security == "reality":
+            pbk = sec_settings.get("publicKey") or sec_settings.get("pbk")
+            if pbk:
+                tls["reality"] = {"enabled": True, "public_key": pbk}
+                sid = sec_settings.get("shortId") or sec_settings.get("sid")
+                if sid:
+                    tls["reality"]["short_id"] = sid
+        outbound["tls"] = tls
+
+    return outbound
+
+
+def _load_profiles_from_text(content: str, allow_happ_links: bool) -> list[Profile]:
+    content = content.strip()
+    if not content:
+        raise ConfigError("empty config")
+
+    if content.startswith("{") or content.startswith("["):
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ConfigError("invalid json config") from exc
+
+        profiles: list[Profile] = []
+        if isinstance(data, list):
+            for i, item in enumerate(data, start=1):
+                if not isinstance(item, dict):
+                    continue
+                remarks = item.get("remarks") or item.get("name") or ""
+                raw_outbounds = item.get("outbounds")
+                if isinstance(raw_outbounds, list):
+                    for ob in raw_outbounds:
+                        parsed_ob = xray_to_singbox_outbound(ob)
+                        if parsed_ob:
+                            name = remarks or ob.get("tag") or parsed_ob.get("server") or f"Profile {i}"
+                            profiles.append(Profile(name=name, outbound=parsed_ob))
+                            break
+                else:
+                    parsed_ob = xray_to_singbox_outbound(item)
+                    if parsed_ob:
+                        name = remarks or item.get("tag") or parsed_ob.get("server") or f"Profile {i}"
+                        profiles.append(Profile(name=name, outbound=parsed_ob))
+            if profiles:
+                return profiles
+            raise ConfigError("no usable outbounds in json list")
+
+        if not isinstance(data, dict):
+            raise ConfigError("json config must be an object or list")
+
+        if "profiles" in data and isinstance(data["profiles"], list):
+            for i, item in enumerate(data["profiles"], start=1):
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                ob = item.get("outbound")
+                if isinstance(ob, dict):
+                    parsed_ob = xray_to_singbox_outbound(ob) or ob
+                    profiles.append(
+                        Profile(
+                            name=name or f"Profile {i}",
+                            outbound=parsed_ob,
+                            subscription_id=item.get("subscription_id"),
+                        )
+                    )
+            if profiles:
+                return profiles
+            raise ConfigError("no usable profiles in json")
+
+        if "outbounds" in data:
+            raw_outbounds = data.get("outbounds")
+            if not isinstance(raw_outbounds, list):
+                raise ConfigError("json outbounds must be a list")
+            for i, outbound in enumerate(raw_outbounds, start=1):
+                if not isinstance(outbound, dict):
+                    continue
+                parsed_ob = xray_to_singbox_outbound(outbound)
+                if parsed_ob:
+                    name = outbound.get("tag") or parsed_ob.get("server") or f"Profile {i}"
+                    profiles.append(Profile(name=name, outbound=parsed_ob))
+            if not profiles:
+                raise ConfigError("no usable outbounds in json")
+            return profiles
+
+        if isinstance(data.get("outbound"), dict):
+            outbound = data["outbound"]
+            parsed_ob = xray_to_singbox_outbound(outbound) or outbound
+            name = data.get("name") or parsed_ob.get("tag") or parsed_ob.get("server") or "Profile 1"
+            return [Profile(name=name, outbound=parsed_ob)]
+
+        if "server" in data and ("type" in data or "protocol" in data):
+            parsed_ob = xray_to_singbox_outbound(data) or data
+            name = data.get("tag") or parsed_ob.get("server") or "Profile 1"
+            return [Profile(name=name, outbound=parsed_ob)]
+
+        raise ConfigError("json does not look like nekobox/sing-box config")
+
+    profiles: list[Profile] = []
+    last_error: ConfigError | None = None
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            if allow_happ_links and is_happ_link(line):
+                profiles.extend(load_happ_link(line))
+            elif allow_happ_links and (line.startswith("http://") or line.startswith("https://")):
+                from app.subscriptions import fetch_subscription_profiles, is_likely_subscription_url
+
+                if is_likely_subscription_url(line):
+                    sub_profiles, _, _ = fetch_subscription_profiles(line)
+                    profiles.extend(sub_profiles)
+                else:
+                    profiles.append(parse_uri_line(line))
+            else:
+                profiles.append(parse_uri_line(line))
+        except ConfigError as exc:
+            last_error = exc
+
+    if not profiles:
+        if last_error is not None:
+            raise last_error
+        raise ConfigError("no links found")
+    return profiles
+
+
+def _load_subscription_content(content: str) -> list[Profile]:
+    try:
+        return _load_profiles_from_text(content, allow_happ_links=False)
+    except ConfigError as first_error:
+        try:
+            decoded = _decode_base64_text(content.strip(), "subscription")
+        except ConfigError:
+            raise first_error
+        try:
+            return _load_profiles_from_text(decoded, allow_happ_links=False)
+        except ConfigError as exc:
+            raise exc from first_error
+
+
+def load_happ_link(link: str, fetcher: Callable[[str], str] | None = None) -> list[Profile]:
+    try:
+        target = unwrap_happ_link(link)
+    except HappLinkError as exc:
+        raise ConfigError(str(exc)) from exc
+
+    target_scheme = urlparse(target).scheme.lower()
+    if target_scheme not in {"http", "https"}:
+        return _load_profiles_from_text(target, allow_happ_links=False)
+
+    try:
+        content = (fetcher or fetch_subscription)(target)
+    except HappLinkError as exc:
+        raise ConfigError(str(exc)) from exc
+    return _load_subscription_content(content)
 
 
 def load_profiles(path: Path) -> list[Profile]:
@@ -419,44 +760,7 @@ def load_profiles(path: Path) -> list[Profile]:
 
 
 def load_profiles_from_text(content: str) -> list[Profile]:
-    content = content.strip()
-    if not content:
-        raise ConfigError("empty config")
-
-    if content.startswith("{"):
-        data = json.loads(content)
-        if "outbounds" in data:
-            outbounds = [x for x in data["outbounds"] if x.get("type") != "direct"]
-            profiles = []
-            for i, outbound in enumerate(outbounds, start=1):
-                name = outbound.get("tag") or outbound.get("server") or f"Profile {i}"
-                profiles.append(Profile(name=name, outbound=outbound))
-            if not profiles:
-                raise ConfigError("no usable outbounds in json")
-            return profiles
-
-        if "server" in data and "type" in data:
-            name = data.get("tag") or data.get("server") or "Profile 1"
-            return [Profile(name=name, outbound=data)]
-
-        raise ConfigError("json does not look like nekobox/sing-box config")
-
-    profiles: list[Profile] = []
-    last_error: ConfigError | None = None
-    for raw_line in content.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        try:
-            profiles.append(parse_uri_line(line))
-        except ConfigError as exc:
-            last_error = exc
-
-    if not profiles:
-        if last_error is not None:
-            raise last_error
-        raise ConfigError("no links found")
-    return profiles
+    return _load_profiles_from_text(content, allow_happ_links=True)
 
 
 def _direct_dns_server() -> dict[str, Any]:
@@ -515,12 +819,11 @@ def build_singbox_config(outbound: dict[str, Any], routing: RoutingOptions | Non
         default_domain_resolver = "custom-dns"
         rules.append({"protocol": "dns", "action": "hijack-dns"})
     elif dns_mode == "proxy":
-        # Force DNS via TCP through proxy so TCP-only profiles do not fail on UDP DNS.
         dns_config = {
             "servers": [
                 {
                     "tag": "proxy-dns",
-                    "type": "tcp",
+                    "type": "udp",
                     "server": "1.1.1.1",
                     "server_port": 53,
                     "detour": proxy_tag,
@@ -532,10 +835,11 @@ def build_singbox_config(outbound: dict[str, Any], routing: RoutingOptions | Non
                     "server_port": 53,
                     "detour": proxy_tag,
                 },
+                _direct_dns_server(),
             ],
             "final": "proxy-dns",
         }
-        default_domain_resolver = "proxy-dns"
+        default_domain_resolver = "direct-dns"
         rules.append({"protocol": "dns", "action": "hijack-dns"})
     else:
         dns_config = {
@@ -595,11 +899,14 @@ def build_singbox_config(outbound: dict[str, Any], routing: RoutingOptions | Non
             {
                 "type": "tun",
                 "tag": "tun-in",
-                "interface_name": "sb-tun",
+                "interface_name": IFACE_NAME,
                 "mtu": 9000,
                 "address": ["172.19.0.1/30"],
                 "auto_route": True,
                 "strict_route": True,
+                # Own table / rule priorities: never collide with other TUN clients (e.g. Happ 2022 / 9000).
+                "iproute2_table_index": ROUTE_TABLE,
+                "iproute2_rule_index": RULE_INDEX,
             }
         ],
         "route": {
@@ -608,12 +915,6 @@ def build_singbox_config(outbound: dict[str, Any], routing: RoutingOptions | Non
             "final": final_outbound,
         },
         "outbounds": outbounds,
-        "experimental": {
-            "cache_file": {
-                "enabled": True,
-                "path": str(singbox_cache_path()),
-            }
-        },
     }
     if default_domain_resolver:
         config["route"]["default_domain_resolver"] = default_domain_resolver

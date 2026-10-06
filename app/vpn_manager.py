@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import shutil
@@ -12,6 +13,7 @@ from PySide6.QtCore import QObject, QProcess, Signal
 
 from app.app_paths import active_config_path, ensure_user_owned, singbox_cache_path
 from app.config_parser import Profile, RoutingOptions, build_singbox_config
+from app import net_session
 
 
 class VpnManager(QObject):
@@ -36,6 +38,9 @@ class VpnManager(QObject):
         self._temp_config.parent.mkdir(parents=True, exist_ok=True)
         self._install_log: list[str] = []
         self._fatal_reported = False
+        self._session: net_session.NetSession | None = None
+        self._net_before: dict[str, list[str]] | None = None
+        self._pending_warning = net_session.reconcile_stale_session()
 
     @property
     def status(self) -> str:
@@ -161,37 +166,60 @@ class VpnManager(QObject):
         return f"{scheme}://{resolved_ip}:{port}"
 
     def _detect_external_conflict(self) -> str | None:
-        try:
-            pgrep = subprocess.run(
-                ["pgrep", "-x", "sing-box"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if pgrep.returncode == 0 and pgrep.stdout.strip():
-                return (
-                    "Another sing-box process is already running. "
-                    "Stop it first (for example: `sudo systemctl stop sing-box`) and try again."
-                )
-        except OSError:
-            pass
+        warning = net_session.reconcile_stale_session()
+        if warning:
+            return warning
 
-        try:
-            ip = subprocess.run(
-                ["ip", "link", "show", "sb-tun"],
-                capture_output=True,
-                text=True,
-                check=False,
+        own: set[int] = set()
+        if self._session is not None and self._session.singbox_pid:
+            own.add(self._session.singbox_pid)
+        if net_session.interface_exists(net_session.IFACE_NAME) and not own:
+            return (
+                f"Interface {net_session.IFACE_NAME} already exists and is not owned by a live session. "
+                "Stop whatever created it (or remove it with `sudo ip link del "
+                f"{net_session.IFACE_NAME}`) and try again."
             )
-            if ip.returncode == 0:
-                return (
-                    "Interface sb-tun already exists. Another VPN instance may still be active. "
-                    "Disconnect/stop it and try again."
-                )
-        except OSError:
-            pass
+        return net_session.detect_foreign_vpn(own)
 
-        return None
+    def take_startup_warning(self) -> str | None:
+        warning, self._pending_warning = self._pending_warning, None
+        return warning
+
+    def _begin_session(self) -> None:
+        self._net_before = net_session.snapshot()
+        self._session = net_session.NetSession.new(self._temp_config)
+        net_session.write_journal(self._session)
+        net_session.net_log(f"session {self._session.session_id} started")
+
+    def _record_singbox_pid(self) -> None:
+        if self._session is None:
+            return
+        pid = int(self.process.processId())
+        self._session.singbox_pid = pid
+        self._session.singbox_starttime = net_session.proc_starttime(pid)
+        net_session.write_journal(self._session)
+        net_session.net_log(
+            f"sing-box pid={pid} owns interface={self._session.interface} "
+            f"table={self._session.routing_tables} rules={self._session.ip_rules[0]}-{self._session.ip_rules[-1]}"
+        )
+
+    def _end_session(self) -> None:
+        """Remove anything of ours that is left, verify and drop the journal."""
+        session, before = self._session, self._net_before
+        self._session = self._net_before = None
+        if session is None:
+            return
+        failed = net_session.remove_owned_leftovers(session)
+        if not failed:
+            net_session.clear_journal()
+        else:
+            self.log_line.emit("WARNING: could not remove: " + ", ".join(failed))
+        if before is not None:
+            diff = net_session.diff_snapshots(before, net_session.snapshot())
+            if diff:
+                logging.warning("[NET] state differs after disconnect: %s", json.dumps(diff))
+            else:
+                net_session.net_log("system state after disconnect == state before connect")
 
     def has_singbox(self) -> bool:
         return self._resolve_singbox() is not None
@@ -321,25 +349,32 @@ class VpnManager(QObject):
         ensure_user_owned(self._temp_config)
 
         self._fatal_reported = False
+        self._begin_session()
         self._set_status("connecting")
         self.log_line.emit(f"Starting profile: {profile.name}")
         self.log_line.emit(f"Using sing-box: {singbox}")
         self.process.start(singbox, ["run", "-c", str(self._temp_config)])
         if not self.process.waitForStarted(4000):
             self._set_status("disconnected")
+            self._end_session()
             self.error.emit("failed to start sing-box")
             return
+        self._record_singbox_pid()
 
     def disconnect(self) -> None:
         if self.process.state() == QProcess.NotRunning:
+            self._end_session()
             self._set_status("disconnected")
             return
 
         self._set_status("disconnecting")
+        # SIGTERM lets sing-box remove its own routes/rules/TUN; only escalate after a generous wait.
         self.process.terminate()
-        if not self.process.waitForFinished(3000):
+        if not self.process.waitForFinished(8000):
+            net_session.net_log("sing-box ignored SIGTERM, sending SIGKILL")
             self.process.kill()
             self.process.waitForFinished(2000)
+        self._end_session()
         self._set_status("disconnected")
         ensure_user_owned(singbox_cache_path())
         self.log_line.emit("VPN disconnected")
@@ -375,6 +410,7 @@ class VpnManager(QObject):
                     self.error.emit("sing-box failed to start. Check detailed logs below.")
 
     def _on_finished(self) -> None:
+        self._end_session()
         if self._status != "disconnected":
             self._set_status("disconnected")
             self.log_line.emit("sing-box process exited")
