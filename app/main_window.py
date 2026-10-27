@@ -15,6 +15,7 @@ from urllib.parse import unquote
 
 from PySide6.QtCore import QEvent, QSettings, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -59,6 +60,7 @@ from app.subscriptions import (
 )
 from app.subscriptions_dialog import SubscriptionsDialog
 from app.net_session import IFACE_NAME
+from app.single_instance import LINK_PREFIX, SERVER_NAME
 from app.vpn_manager import VpnManager
 
 
@@ -146,6 +148,7 @@ class MainWindow(QMainWindow):
     subscription_update_finished = Signal(str, object, object, str)
     # Worker threads must not touch widgets; they log through this queued signal.
     worker_log = Signal(str)
+    resume_probe_finished = Signal(bool)
 
     def __init__(self, initial_link: str | None = None) -> None:
         super().__init__()
@@ -192,6 +195,11 @@ class MainWindow(QMainWindow):
         self._restore_settings()
         self._restore_profiles()
         self._setup_notifications()
+        self._sleep_was_connected = False
+        self._sleep_connected_index: int | None = None
+        self._instance_server: QLocalServer | None = None
+        self._setup_instance_server()
+        self._setup_sleep_monitor()
         self._set_status("disconnected")
         self.vpn.refresh_singbox_availability()
         # Deferred: a modal dialog must not block window construction at startup.
@@ -200,6 +208,9 @@ class MainWindow(QMainWindow):
         if startup_warning:
             self.logs.append(f"WARNING: {startup_warning}")
             logging.warning(startup_warning)
+        for env_warning in self.vpn.environment_warnings():
+            self.logs.append(f"WARNING: {env_warning}")
+            logging.warning(env_warning)
 
         self.latency_timer = QTimer(self)
         self.latency_timer.setInterval(10000)
@@ -940,11 +951,109 @@ class MainWindow(QMainWindow):
         painter.end()
         return QIcon(pixmap)
 
-    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+    def _bring_to_front(self) -> None:
         self.show()
         self.raise_()
         self.activateWindow()
         self.setWindowState(self.windowState() & ~Qt.WindowMinimized | Qt.WindowActive)
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        self._bring_to_front()
+
+    def _setup_instance_server(self) -> None:
+        """Serve second-instance launches: show window / import their link."""
+        try:
+            QLocalServer.removeServer(SERVER_NAME)  # stale socket from a crash
+            server = QLocalServer(self)
+            if not server.listen(SERVER_NAME):
+                logging.warning("Single-instance server failed: %s", server.errorString())
+                return
+            server.newConnection.connect(self._on_instance_connection)
+            self._instance_server = server
+        except Exception as exc:
+            logging.warning("Single-instance server unavailable: %s", exc)
+
+    def _on_instance_connection(self) -> None:
+        server = self._instance_server
+        if server is None:
+            return
+        sock = server.nextPendingConnection()
+        if sock is None:
+            return
+        try:
+            sock.waitForReadyRead(1000)
+            message = bytes(sock.readAll()).decode("utf-8", errors="replace")
+        except Exception:
+            message = ""
+        finally:
+            sock.disconnectFromServer()
+            sock.deleteLater()
+        self._bring_to_front()
+        if message.startswith(LINK_PREFIX):
+            link = message[len(LINK_PREFIX):].strip()
+            if link:
+                self._start_happ_import(link, "second instance")
+
+    def _setup_sleep_monitor(self) -> None:
+        """Reconnect the tunnel after system suspend via systemd-logind D-Bus."""
+        try:
+            from PySide6.QtDBus import QDBusConnection
+        except ImportError:
+            logging.debug("QtDBus unavailable; suspend/resume monitoring disabled")
+            return
+        try:
+            bus = QDBusConnection.systemBus()
+            if bus.isConnected() and bus.connect(
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager",
+                "PrepareForSleep",
+                self._on_prepare_for_sleep,
+            ):
+                logging.info("Suspend/resume monitoring enabled (logind D-Bus)")
+                return
+            logging.debug("logind D-Bus unavailable; suspend/resume monitoring disabled")
+        except Exception as exc:
+            logging.debug("Suspend/resume monitoring disabled: %s", exc)
+
+    def _on_prepare_for_sleep(self, sleeping: bool) -> None:
+        if sleeping:
+            self._sleep_was_connected = self.vpn.status == "connected"
+            self._sleep_connected_index = self.connected_index
+            if self._sleep_was_connected:
+                self._append_log("System is going to sleep; VPN state saved")
+            return
+        if not self._sleep_was_connected:
+            return
+        self._sleep_was_connected = False
+        self._append_log("System resumed; verifying VPN tunnel...")
+        QTimer.singleShot(2500, self._verify_after_resume)
+
+    def _verify_after_resume(self) -> None:
+        index = self._sleep_connected_index
+        if index is None or index >= len(self.profiles):
+            return
+        if self.vpn.status != "connected":
+            self._append_log("VPN session did not survive suspend; reconnecting...")
+            self._connect_profile(index)
+            return
+        threading.Thread(target=self._resume_probe_worker, daemon=True).start()
+
+    def _resume_probe_worker(self) -> None:
+        res = probe_active_connection(timeout_sec=4.0)
+        self.resume_probe_finished.emit(bool(res and res.get("ok")))
+
+    def _on_resume_probe_finished(self, ok: bool) -> None:
+        if ok:
+            self._append_log("VPN tunnel survived suspend")
+            return
+        index = self._sleep_connected_index
+        if index is None or index >= len(self.profiles):
+            return
+        if self.vpn.status != "connected":
+            return  # already reconnecting or stopped by the user
+        self._append_log("VPN tunnel is dead after resume; reconnecting...")
+        self._connect_profile(index)
 
     def _notify_user(self, title: str, message: str) -> None:
         if self.tray_icon is not None:
@@ -1475,6 +1584,7 @@ class MainWindow(QMainWindow):
         self.vpn.singbox_availability_changed.connect(self._on_singbox_availability_changed)
         self.vpn.install_state_changed.connect(self._on_install_state_changed)
         self.latencies_ready.connect(self._on_latencies_ready)
+        self.resume_probe_finished.connect(self._on_resume_probe_finished)
         self.profile_list.currentRowChanged.connect(self._on_profile_list_row_changed)
         self.profile_list.customContextMenuRequested.connect(self._show_profile_context_menu)
         self.profile_list.itemDoubleClicked.connect(lambda _item: self._connect_selected_profile())

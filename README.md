@@ -43,7 +43,7 @@ pip install -r requirements.txt pyinstaller
 ```
 
 ## Важно про `sing-box`
-Приложение запускает команду `sing-box run -c <config>`, поэтому `sing-box` должен быть установлен и доступен в `PATH`.
+Приложение запускает команду `sing-box run -c <config>`, поэтому `sing-box` должен быть установлен и доступен в `PATH`. Рекомендуется sing-box 1.8.0+ (при более старой версии приложение покажет предупреждение).
 
 Пример для Ubuntu:
 ```bash
@@ -77,9 +77,24 @@ Debug режим:
 /path/to/nekobox_gui_app/dist/ambox-linux -d
 ```
 
+Запуск свёрнутым в трей (удобно для автозапуска):
+```bash
+/path/to/nekobox_gui_app/dist/ambox-linux --tray
+```
+
 Импорт Happ-ссылки при запуске:
 ```bash
 /path/to/nekobox_gui_app/dist/ambox-linux 'happ://add/https://subscription.example/profile'
+```
+
+Второй запущенный экземпляр не создаёт новое окно: он передаёт ссылку (если есть) уже работающему приложению и завершается. После выхода из сна VPN-туннель проверяется и при необходимости переподключается автоматически.
+
+Ярлык для меню приложений и автозапуска — `packaging/ambox.desktop` (путь в `Exec=` поправь под себя):
+```bash
+cp packaging/ambox.desktop ~/.local/share/applications/
+update-desktop-database ~/.local/share/applications
+# автозапуск при входе:
+cp packaging/ambox.desktop ~/.config/autostart/
 ```
 
 Данные приложения сохраняются в `~/.ambox`:

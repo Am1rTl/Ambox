@@ -11,10 +11,11 @@ from logging.handlers import RotatingFileHandler
 
 from PySide6.QtCore import QSocketNotifier, QTimer
 from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
 from app.app_paths import log_path
 from app.main_window import MainWindow
+from app.single_instance import SingleInstanceGuard, notify_running_instance
 
 
 _DAEMON_ENV = "AMBOX_DAEMONIZED"
@@ -167,6 +168,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Stay in the foreground (skip daemonization), e.g. for debugging",
     )
     parser.add_argument(
+        "--tray",
+        action="store_true",
+        help="Start minimized to the system tray instead of showing the window",
+    )
+    parser.add_argument(
         "link",
         nargs="?",
         help="Optional happ:// link to import at startup",
@@ -202,8 +208,20 @@ def main(argv: list[str] | None = None) -> int:
     app.setPalette(palette)
     app.setStyleSheet("QToolTip { background-color: #1c202b; border: 1px solid #3a3f4d; color: #d9dce3; }")
     _install_excepthook(args.debug)
+    _instance_guard = SingleInstanceGuard()
+    if not _instance_guard.try_acquire():
+        if notify_running_instance(args.link):
+            logging.info("Another instance is already running; notified it and exiting")
+        else:
+            logging.warning("Instance lock is held but the running instance is unreachable")
+        return 0
     window = MainWindow(initial_link=args.link)
-    window.show()
+    if args.tray and QSystemTrayIcon.isSystemTrayAvailable():
+        logging.info("Starting minimized to tray (--tray)")
+    else:
+        if args.tray:
+            logging.warning("--tray requested but no system tray is available; showing window")
+        window.show()
     app.aboutToQuit.connect(window.vpn.disconnect)
     _signal_guard = _install_signal_wakeup(app)
     logging.info("Main window initialized")

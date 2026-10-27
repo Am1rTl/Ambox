@@ -18,6 +18,22 @@ from app.latency import find_unavailable_nodes
 from app.xray_bundle import ensure_rule_sets, required_rule_sets
 from app import net_session
 
+# Advisory floor: generated configs use binary rule-sets and
+# route.auto_detect_interface, which need a 2024+ sing-box. The check only
+# warns (never blocks connecting) so an off-by release is harmless.
+MIN_SINGBOX_VERSION = (1, 8, 0)
+
+
+def parse_singbox_version(output: str) -> tuple[int, int, int] | None:
+    """Parse the first line of `sing-box version` ("sing-box version 1.14.0")."""
+    lines = (output or "").strip().splitlines()
+    if not lines:
+        return None
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", lines[0])
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
 
 class VpnManager(QObject):
     status_changed = Signal(str)
@@ -47,6 +63,8 @@ class VpnManager(QObject):
         self._pending_warning = net_session.reconcile_stale_session()
         self._connect_generation = 0
         self._pending_connect: tuple[Profile, RoutingOptions | None] | None = None
+        self._singbox_version: tuple[int, int, int] | None = None
+        self._version_checked = False
         self._prepared.connect(self._on_prepared)
 
     @property
@@ -231,6 +249,27 @@ class VpnManager(QObject):
     def has_singbox(self) -> bool:
         return self._resolve_singbox() is not None
 
+    def singbox_version(self) -> tuple[int, int, int] | None:
+        """Cached (major, minor, patch) of the resolved sing-box binary."""
+        if self._version_checked:
+            return self._singbox_version
+        self._version_checked = True
+        singbox = self._resolve_singbox()
+        if not singbox:
+            return None
+        try:
+            proc = subprocess.run(
+                [singbox, "version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        self._singbox_version = parse_singbox_version(proc.stdout or proc.stderr)
+        return self._singbox_version
+
     def singbox_has_net_admin(self) -> bool | None:
         """True/False when verifiable, None when unknown (missing binary/setcap or check failed)."""
         singbox = self._resolve_singbox()
@@ -254,6 +293,15 @@ class VpnManager(QObject):
         singbox = self._resolve_singbox()
         if not singbox:
             warnings.append("sing-box executable was not found in PATH or common install locations.")
+        else:
+            version = self.singbox_version()
+            if version is not None and version < MIN_SINGBOX_VERSION:
+                minimum = ".".join(map(str, MIN_SINGBOX_VERSION))
+                found = ".".join(map(str, version))
+                warnings.append(
+                    f"sing-box {found} is older than the minimum supported {minimum}. "
+                    "Please upgrade sing-box."
+                )
         if shutil.which("ip") is None:
             warnings.append("The `ip` command is missing. Interface checks may be incomplete.")
         if shutil.which("pgrep") is None:
@@ -362,6 +410,9 @@ class VpnManager(QObject):
             self.error.emit("sing-box not found. Click 'Install sing-box'.")
             self.refresh_singbox_availability()
             return
+        version = self.singbox_version()
+        if version is not None:
+            self.log_line.emit(f"sing-box version: {'.'.join(map(str, version))}")
 
         self._connect_generation += 1
         self._set_status("connecting")
@@ -565,4 +616,6 @@ class VpnManager(QObject):
                 self.error.emit("Network/DNS error while installing sing-box. Check internet and retry.")
             else:
                 self.error.emit("sing-box installation failed or was cancelled")
+        self._singbox_version = None
+        self._version_checked = False
         self.refresh_singbox_availability()

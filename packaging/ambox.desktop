@@ -1,0 +1,23 @@
+# ambox desktop entry (Linux).
+#
+# Install for the current user:
+#   1. Fix the Exec= path below to point at your ambox-linux binary.
+#   2. cp packaging/ambox.desktop ~/.local/share/applications/
+#   3. update-desktop-database ~/.local/share/applications
+#
+# Autostart at login (minimized to tray):
+#   cp packaging/ambox.desktop ~/.config/autostart/
+#   and append " --tray" to the Exec= line in the autostart copy.
+#
+# The happ:// URL handler lets browsers / other apps open Happ links in ambox:
+#   xdg-mime default ambox.desktop x-scheme-handler/happ
+[Desktop Entry]
+Type=Application
+Name=ambox
+Comment=VPN client for NekoBox/sing-box configs
+Exec=ambox-linux %u
+Icon=ambox
+Terminal=false
+Categories=Network;Security;
+MimeType=x-scheme-handler/happ;
+StartupWMClass=ambox
