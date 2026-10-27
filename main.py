@@ -9,7 +9,7 @@ import sys
 import traceback
 from logging.handlers import RotatingFileHandler
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QSocketNotifier, QTimer
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -93,6 +93,54 @@ def _configure_logging(debug: bool) -> None:
     logging.info("Application started. debug=%s", debug)
 
 
+def _install_signal_wakeup(app: QApplication) -> object:
+    """Quit through Qt on SIGTERM/SIGINT/SIGHUP so VpnManager tears down TUN cleanly.
+
+    Python signal handlers only run when the interpreter regains control, which a
+    bare Qt event loop never yields. A wakeup fd + QSocketNotifier wakes the loop
+    on any signal instead of polling with a QTimer. Falls back to a 500ms QTimer
+    where socketpair/wakeup-fd is unavailable. The caller must keep the returned
+    guard alive for the whole application lifetime.
+    """
+    watched = [signal.SIGTERM, signal.SIGINT]
+    sighup = getattr(signal, "SIGHUP", None)  # missing on Windows
+    if sighup is not None:
+        watched.append(sighup)
+    for sig in watched:
+        try:
+            signal.signal(sig, lambda *_args: app.quit())
+        except (OSError, ValueError):
+            continue
+
+    if os.name == "posix":
+        try:
+            import socket as _socket
+
+            rsock, wsock = _socket.socketpair()
+            rsock.setblocking(False)
+            wsock.setblocking(False)
+            signal.set_wakeup_fd(wsock.fileno(), warn_on_full_buffer=False)
+        except (OSError, ValueError):
+            pass
+        else:
+            notifier = QSocketNotifier(rsock.fileno(), QSocketNotifier.Type.Read)
+
+            def _drain() -> None:
+                try:
+                    rsock.recv(1024)
+                except OSError:
+                    pass
+
+            notifier.activated.connect(lambda *_args: _drain())
+            notifier.setEnabled(True)
+            return (notifier, rsock, wsock)
+
+    keepalive = QTimer()
+    keepalive.start(500)
+    keepalive.timeout.connect(lambda: None)
+    return keepalive
+
+
 def _install_excepthook(debug: bool) -> None:
     def _hook(exc_type, exc_value, exc_tb) -> None:
         text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
@@ -156,13 +204,8 @@ def main(argv: list[str] | None = None) -> int:
     _install_excepthook(args.debug)
     window = MainWindow(initial_link=args.link)
     window.show()
-    # SIGTERM/SIGINT: quit through Qt so VpnManager tears down the TUN session cleanly.
-    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(sig, lambda *_: app.quit())
     app.aboutToQuit.connect(window.vpn.disconnect)
-    _keepalive = QTimer()  # lets the Python signal handlers run inside the Qt loop
-    _keepalive.start(500)
-    _keepalive.timeout.connect(lambda: None)
+    _signal_guard = _install_signal_wakeup(app)
     logging.info("Main window initialized")
     return app.exec()
 

@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 from app.app_paths import ensure_user_owned, import_configs_dir, log_path, profiles_path, settings_path
 from app.config_parser import ConfigError, Profile, RoutingOptions, load_happ_link, load_profiles, load_profiles_from_text, parse_domains_text
 from app.happ_links import is_happ_link
-from app.latency import profile_latency_ms, probe_active_connection
+from app.latency import MAX_PROBE_WORKERS, profile_latency_ms, probe_active_connection
 from app.xray_bundle import ensure_rule_sets, required_rule_sets
 from app.locations import detect_location, iso_to_flag
 from app.subscriptions import (
@@ -1926,7 +1926,7 @@ class MainWindow(QMainWindow):
             return
         indices_to_remove = [i for i, p in enumerate(self.profiles) if p.subscription_id == sub_id]
         if self.connected_index in indices_to_remove:
-            self.vpn.disconnect()
+            self.vpn.request_disconnect()
             self.connected_index = None
 
         self.profiles = [p for i, p in enumerate(self.profiles) if i not in indices_to_remove]
@@ -2052,7 +2052,7 @@ class MainWindow(QMainWindow):
     def _delete_profile_at_index(self, index: int) -> None:
         profile = self.profiles[index]
         if self.connected_index == index:
-            self.vpn.disconnect()
+            self.vpn.request_disconnect()
 
         del self.profiles[index]
         del self.profile_latencies[index]
@@ -2290,8 +2290,8 @@ class MainWindow(QMainWindow):
         self._connect_profile(index)
 
     def _connect_fastest(self) -> None:
-        if self.vpn.status in {"connected", "connecting"}:
-            self.vpn.disconnect()
+        if self.vpn.status in {"connected", "connecting", "disconnecting"}:
+            self.vpn.request_disconnect()
             return
         best = self._best_profile_index()
         if best is None:
@@ -2305,8 +2305,8 @@ class MainWindow(QMainWindow):
         self._connect_profile(best)
 
     def toggle_connection(self) -> None:
-        if self.vpn.status in {"connected", "connecting"}:
-            self.vpn.disconnect()
+        if self.vpn.status in {"connected", "connecting", "disconnecting"}:
+            self.vpn.request_disconnect()
             return
 
         index = self._selected_profile_index()
@@ -2334,9 +2334,8 @@ class MainWindow(QMainWindow):
             self._show_error("Enter a Custom DNS server address.")
             return
 
-        if self.vpn.status in {"connected", "connecting"}:
-            self.vpn.disconnect()
-
+        # No explicit stop here: VpnManager.connect_profile queues the switch
+        # and restarts the session itself without blocking the GUI thread.
         self._ensure_profile_visible(index)
         self._set_selected_profile_index(index)
         self.connected_index = index
@@ -2496,7 +2495,7 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _scan_latency_worker(self, scan_id: int, profiles: list[Profile], timeout_sec: float) -> None:
-        workers = min(24, max(4, len(profiles)))
+        workers = min(MAX_PROBE_WORKERS, max(2, len(profiles)))
         with ThreadPoolExecutor(max_workers=workers) as executor:
             results = list(executor.map(lambda p: profile_latency_ms(p, timeout_sec), profiles))
         self.latencies_ready.emit(scan_id, results)

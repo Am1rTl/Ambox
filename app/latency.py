@@ -5,6 +5,7 @@ import os
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -12,6 +13,49 @@ from urllib.request import Request, urlopen
 
 from app.config_parser import Profile, convert_bundle_outbound, normalize_outbound
 from app.xray_bundle import bundle_proxy_outbounds
+
+# Probes are expensive (a sing-box subprocess + TLS handshake each), and the same
+# nodes are re-scanned every 10s plus on every auto-switch tick. Cache results.
+LATENCY_CACHE_TTL_OK = 60.0
+LATENCY_CACHE_TTL_FAIL = 15.0
+_LATENCY_CACHE: dict[str, tuple[float, int | None]] = {}
+_LATENCY_CACHE_LOCK = threading.Lock()
+# Hard cap: each worker spawns a sing-box subprocess; more workers only thrash.
+MAX_PROBE_WORKERS = 8
+
+
+def _latency_cache_key(outbound: dict[str, Any]) -> str:
+    normalized = {k: v for k, v in outbound.items() if k != "tag"}
+    try:
+        return json.dumps(normalized, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return repr(sorted(normalized.items(), key=lambda item: str(item[0])))
+
+
+def clear_latency_cache() -> None:
+    with _LATENCY_CACHE_LOCK:
+        _LATENCY_CACHE.clear()
+
+
+def _cached_latency(key: str) -> tuple[bool, int | None]:
+    now = time.monotonic()
+    with _LATENCY_CACHE_LOCK:
+        entry = _LATENCY_CACHE.get(key)
+        if entry is None:
+            return False, None
+        timestamp, value = entry
+        ttl = LATENCY_CACHE_TTL_OK if value is not None else LATENCY_CACHE_TTL_FAIL
+        if now - timestamp > ttl:
+            _LATENCY_CACHE.pop(key, None)
+            return False, None
+        return True, value
+
+
+def _store_latency(key: str, value: int | None) -> None:
+    with _LATENCY_CACHE_LOCK:
+        if len(_LATENCY_CACHE) > 4096:
+            _LATENCY_CACHE.clear()
+        _LATENCY_CACHE[key] = (time.monotonic(), value)
 
 
 def _extract_endpoint(outbound: dict[str, Any]) -> tuple[str, int] | None:
@@ -53,14 +97,23 @@ def _find_singbox() -> str | None:
     return None
 
 
-def outbound_latency_ms(outbound: dict[str, Any], timeout_sec: float = 2.5) -> int | None:
+def outbound_latency_ms(
+    outbound: dict[str, Any], timeout_sec: float = 2.5, use_cache: bool = True
+) -> int | None:
     singbox = _find_singbox()
+    probed = normalize_outbound(outbound) if singbox else outbound
+    cache_key = _latency_cache_key(probed)
+    if use_cache:
+        hit, cached = _cached_latency(cache_key)
+        if hit:
+            return cached
+
+    result: int | None
     if singbox:
-        outbound = normalize_outbound(outbound)
-        tag = str(outbound.get("tag") or "proxy")
+        tag = str(probed.get("tag") or "proxy")
         # auto_detect_interface binds the probe to the physical interface, so while the VPN is up
         # servers are measured directly instead of through the active tunnel.
-        cfg = {"outbounds": [outbound], "route": {"auto_detect_interface": True}}
+        cfg = {"outbounds": [probed], "route": {"auto_detect_interface": True}}
         start = time.perf_counter()
         try:
             res = subprocess.run(
@@ -80,25 +133,25 @@ def outbound_latency_ms(outbound: dict[str, Any], timeout_sec: float = 2.5) -> i
                 timeout=timeout_sec,
             )
             elapsed = int((time.perf_counter() - start) * 1000)
-            if res.returncode == 0:
-                return max(1, elapsed)
-            return None
+            result = max(1, elapsed) if res.returncode == 0 else None
         except Exception:
+            result = None
+    else:
+        endpoint = _extract_endpoint(probed)
+        if endpoint is None:
             return None
+        started = time.perf_counter()
+        try:
+            sock = socket.create_connection(endpoint, timeout=timeout_sec)
+            sock.close()
+        except OSError:
+            result = None
+        else:
+            result = max(1, int((time.perf_counter() - started) * 1000))
 
-    endpoint = _extract_endpoint(outbound)
-    if endpoint is None:
-        return None
-
-    started = time.perf_counter()
-    try:
-        sock = socket.create_connection(endpoint, timeout=timeout_sec)
-        sock.close()
-    except OSError:
-        return None
-
-    elapsed_ms = int((time.perf_counter() - started) * 1000)
-    return max(1, elapsed_ms)
+    if use_cache:
+        _store_latency(cache_key, result)
+    return result
 
 
 def _backup_candidates(profile: Profile, limit: int) -> list[dict[str, Any]]:
@@ -142,7 +195,7 @@ def find_unavailable_nodes(xray: dict[str, Any], timeout_sec: float = 4.0) -> se
         by_node.setdefault(key, []).append(xtag)
         probes.setdefault(key, outbound)
     keys = list(probes)
-    with ThreadPoolExecutor(max_workers=min(32, len(keys))) as executor:
+    with ThreadPoolExecutor(max_workers=min(MAX_PROBE_WORKERS, len(keys))) as executor:
         results = list(executor.map(lambda k: outbound_latency_ms(probes[k], timeout_sec), keys))
     dead: set[str] = set()
     for key, latency in zip(keys, results):

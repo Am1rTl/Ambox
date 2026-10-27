@@ -10,7 +10,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QObject, QProcess, Signal
+from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 
 from app.app_paths import active_config_path, ensure_user_owned, singbox_cache_path
 from app.config_parser import Profile, RoutingOptions, build_singbox_config
@@ -46,6 +46,7 @@ class VpnManager(QObject):
         self._net_before: dict[str, list[str]] | None = None
         self._pending_warning = net_session.reconcile_stale_session()
         self._connect_generation = 0
+        self._pending_connect: tuple[Profile, RoutingOptions | None] | None = None
         self._prepared.connect(self._on_prepared)
 
     @property
@@ -338,9 +339,18 @@ class VpnManager(QObject):
             return
 
     def connect_profile(self, profile: Profile, routing: RoutingOptions | None = None) -> None:
-        if self.process.state() != QProcess.NotRunning or self._status == "connecting":
-            self.error.emit("VPN already running")
+        if (
+            self.process.state() != QProcess.NotRunning
+            or self._status in {"connecting", "disconnecting"}
+        ):
+            # Profile switch or auto-switch while a session is active: stop the
+            # current session first, then start the new one from _on_finished.
+            # Never blocks the GUI thread.
+            self._pending_connect = (profile, routing)
+            self.log_line.emit(f"Switching to profile: {profile.name} (stopping current session...)")
+            self.request_disconnect(cancel_pending=False)
             return
+        self._pending_connect = None
 
         conflict = self._detect_external_conflict()
         if conflict:
@@ -421,15 +431,57 @@ class VpnManager(QObject):
             return
         self._record_singbox_pid()
 
-    def disconnect(self) -> None:
+    def request_disconnect(self, cancel_pending: bool = True) -> None:
+        """Stop the VPN without blocking the GUI thread.
+
+        SIGTERM is sent immediately; if sing-box is still alive after 8s it is
+        SIGKILLed via a timer. Cleanup happens in _on_finished, which also
+        picks up a queued profile switch (see connect_profile).
+        """
         self._connect_generation += 1
+        generation = self._connect_generation
+        if cancel_pending:
+            self._pending_connect = None
+        if self.process.state() == QProcess.NotRunning:
+            self._end_session()
+            self._set_status("disconnected")
+            self._start_pending_connect()
+            return
+
+        self._set_status("disconnecting")
+        # SIGTERM lets sing-box remove its own routes/rules/TUN; only escalate after a generous wait.
+        self.process.terminate()
+        QTimer.singleShot(8000, lambda: self._escalate_disconnect(generation))
+
+    def _escalate_disconnect(self, generation: int) -> None:
+        if generation != self._connect_generation or self._status != "disconnecting":
+            return  # already finished or superseded by a new connect
+        if self.process.state() == QProcess.NotRunning:
+            return  # _on_finished is on its way
+        net_session.net_log("sing-box ignored SIGTERM, sending SIGKILL")
+        self.process.kill()
+
+    def _start_pending_connect(self) -> None:
+        pending, self._pending_connect = self._pending_connect, None
+        if pending is None or self._status != "disconnected":
+            return
+        profile, routing = pending
+        self.connect_profile(profile, routing)
+
+    def disconnect(self) -> None:
+        """Synchronous stop for application shutdown (closeEvent/aboutToQuit).
+
+        UI-initiated stops must use request_disconnect() instead: this blocks
+        the calling thread for up to ~10s.
+        """
+        self._connect_generation += 1
+        self._pending_connect = None
         if self.process.state() == QProcess.NotRunning:
             self._end_session()
             self._set_status("disconnected")
             return
 
         self._set_status("disconnecting")
-        # SIGTERM lets sing-box remove its own routes/rules/TUN; only escalate after a generous wait.
         self.process.terminate()
         if not self.process.waitForFinished(8000):
             net_session.net_log("sing-box ignored SIGTERM, sending SIGKILL")
@@ -474,7 +526,9 @@ class VpnManager(QObject):
         self._end_session()
         if self._status != "disconnected":
             self._set_status("disconnected")
+            ensure_user_owned(singbox_cache_path())
             self.log_line.emit("sing-box process exited")
+        self._start_pending_connect()
 
     def _read_install_stdout(self) -> None:
         output = self._strip_ansi(
