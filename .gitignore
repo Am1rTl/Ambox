@@ -42,7 +42,8 @@ ss*.txt
 *.ovpn
 *.mobileconfig
 
-# Secrets and credentials
+# Secrets and credentials (kept specific: broad *secret*/*token* patterns would
+# swallow future source files like app/token_store.py)
 .env
 .env.*
 *.pem
@@ -50,6 +51,9 @@ ss*.txt
 *.p12
 *.pfx
 credentials*.json
+credentials*.yaml
+credentials*.yml
 secrets*.json
-*secret*
-*token*
+secrets*.yaml
+secrets*.yml
+tokens*.json
