@@ -19,6 +19,26 @@ from app.happ_links import (
 )
 
 
+def _coerce_number(value: Any, default: float = 0) -> int | float:
+    """Best-effort number coercion for values loaded from JSON or headers."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return default
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                return float(text)
+            except ValueError:
+                return default
+    return default
+
+
 @dataclass
 class Subscription:
     id: str
@@ -35,42 +55,101 @@ class Subscription:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Subscription:
+        user_info = data.get("user_info")
         return cls(
             id=str(data.get("id") or ""),
             name=str(data.get("name") or "Subscription"),
             url=str(data.get("url") or ""),
             original_link=str(data.get("original_link") or ""),
-            updated_at=float(data.get("updated_at") or 0.0),
-            profile_count=int(data.get("profile_count") or 0),
+            updated_at=float(_coerce_number(data.get("updated_at"), 0.0)),
+            profile_count=int(_coerce_number(data.get("profile_count"), 0)),
             auto_update=bool(data.get("auto_update", True)),
-            user_info=dict(data.get("user_info") or {}),
+            user_info=dict(user_info) if isinstance(user_info, dict) else {},
+        )
+
+    def traffic_stats(self) -> TrafficStats:
+        """Used/limit/remaining/percent/expiry derived from user_info.
+
+        Handles missing (None/absent), zero, negative and string values:
+        a missing or non-positive total means an unlimited plan.
+        ``has_data`` is False when the provider sent no user_info at all,
+        which callers must render as "no data", not "unlimited".
+        """
+        info = self.user_info if isinstance(self.user_info, dict) else {}
+        upload = max(0.0, float(_coerce_number(info.get("upload"), 0)))
+        download = max(0.0, float(_coerce_number(info.get("download"), 0)))
+        total_raw = float(_coerce_number(info.get("total"), 0))
+        expire = max(0.0, float(_coerce_number(info.get("expire"), 0)))
+
+        used = upload + download
+        unlimited = total_raw <= 0
+        total = total_raw if not unlimited else None
+        if unlimited:
+            remaining: float | None = None
+            percent = 0.0
+            over_quota = False
+        else:
+            remaining = max(0.0, total_raw - used)
+            percent = min(100.0, (used / total_raw * 100.0) if total_raw > 0 else 0.0)
+            over_quota = used > total_raw
+        expire_str = time.strftime("%Y-%m-%d", time.localtime(expire)) if expire > 0 else ""
+        return TrafficStats(
+            used=used,
+            total=total,
+            remaining=remaining,
+            percent=percent,
+            unlimited=unlimited,
+            over_quota=over_quota,
+            expire=expire,
+            expire_str=expire_str,
+            has_data=bool(info),
         )
 
     def userinfo_summary(self) -> str:
         if not self.user_info:
             return ""
-        upload = self.user_info.get("upload", 0)
-        download = self.user_info.get("download", 0)
-        total = self.user_info.get("total", 0)
-        expire = self.user_info.get("expire", 0)
-
-        used = upload + download
+        stats = self.traffic_stats()
         parts: list[str] = []
-        if total > 0:
-            parts.append(f"Traffic: {format_bytes(used)} / {format_bytes(total)}")
-        elif used > 0:
-            parts.append(f"Used: {format_bytes(used)}")
+        if stats.unlimited:
+            if stats.used > 0:
+                parts.append(f"Used: {format_bytes(stats.used)} (unlimited)")
+        else:
+            assert stats.total is not None
+            text = f"Traffic: {format_bytes(stats.used)} / {format_bytes(stats.total)}"
+            if stats.over_quota:
+                text += " (over quota)"
+            parts.append(text)
 
-        if expire > 0:
-            expire_str = time.strftime("%Y-%m-%d", time.localtime(expire))
-            parts.append(f"Expires: {expire_str}")
+        if stats.expire_str:
+            parts.append(f"Expires: {stats.expire_str}")
 
         return " | ".join(parts)
 
 
-def format_bytes(value: int | float) -> str:
+@dataclass(frozen=True)
+class TrafficStats:
+    used: float
+    total: float | None  # None = unlimited plan
+    remaining: float | None  # None = unlimited plan
+    percent: float  # 0..100, clamped
+    unlimited: bool
+    over_quota: bool
+    expire: float  # 0 = no expiry info
+    expire_str: str  # "" = no expiry info
+    has_data: bool  # False = provider sent no user_info; not "unlimited"
+
+
+def format_bytes(value: Any) -> str:
+    if value is None:
+        return "—"
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return "—"
+    if number != number:  # NaN
+        return "—"
     units = ["B", "KB", "MB", "GB", "TB"]
-    size = float(max(0, value))
+    size = max(0.0, number)
     unit = units[0]
     for unit in units:
         if size < 1024 or unit == units[-1]:
@@ -186,26 +265,32 @@ class SubscriptionStore:
         try:
             raw = self.path.read_text(encoding="utf-8")
             data = json.loads(raw)
-            if isinstance(data, list):
-                self.subscriptions = {
-                    sub.id: sub
-                    for item in data
-                    if isinstance(item, dict)
-                    for sub in [Subscription.from_dict(item)]
-                    if sub.id
-                }
-            elif isinstance(data, dict) and "subscriptions" in data:
-                self.subscriptions = {
-                    sub.id: sub
-                    for item in data["subscriptions"]
-                    if isinstance(item, dict)
-                    for sub in [Subscription.from_dict(item)]
-                    if sub.id
-                }
         except (OSError, ValueError):
             self.subscriptions = {}
+            return
+        items: list[Any]
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict) and isinstance(data.get("subscriptions"), list):
+            items = data["subscriptions"]
+        else:
+            self.subscriptions = {}
+            return
+        # One corrupt entry must not wipe the whole store: skip bad items.
+        subs: dict[str, Subscription] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                sub = Subscription.from_dict(item)
+            except (TypeError, ValueError):
+                continue
+            if sub.id:
+                subs[sub.id] = sub
+        self.subscriptions = subs
 
     def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"subscriptions": [sub.to_dict() for sub in self.subscriptions.values()]}
         tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")

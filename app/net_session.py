@@ -142,7 +142,37 @@ def is_session_singbox(session: NetSession, pid: int) -> bool:
     return bool(args) and session.config_path in args
 
 
+# sing-box global options that consume the following token and may precede
+# the subcommand (e.g. `sing-box -D /tmp/x run -c ...`).
+_SINGBOX_GLOBAL_OPTS_WITH_VALUE = frozenset(
+    {"-C", "-D", "-u", "--config-directory", "--working-directory", "--user"}
+)
+
+
+def singbox_subcommand(args: list[str]) -> str:
+    """First positional token of a sing-box command line ("" if none)."""
+    skip_next = False
+    for token in args[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in _SINGBOX_GLOBAL_OPTS_WITH_VALUE:
+            skip_next = True
+            continue
+        if token.startswith("-") and token != "-":
+            continue
+        return token
+    return ""
+
+
 def find_singbox_pids() -> list[int]:
+    """PIDs of sing-box instances that can hold VPN/TUN state.
+
+    Only ``sing-box run`` creates interfaces, routes and rules. Short-lived
+    helpers such as ``sing-box tools fetch`` (our own latency probes) must not
+    count, otherwise pressing Connect while a probe runs reports a phantom
+    foreign VPN with an already-dead pid.
+    """
     pids: list[int] = []
     try:
         names = os.listdir("/proc")
@@ -155,8 +185,11 @@ def find_singbox_pids() -> list[int]:
             comm = Path(f"/proc/{name}/comm").read_text(encoding="utf-8").strip()
         except OSError:
             continue
-        if comm == "sing-box":
-            pids.append(int(name))
+        if comm != "sing-box":
+            continue
+        pid = int(name)
+        if singbox_subcommand(proc_cmdline(pid)) == "run":
+            pids.append(pid)
     return pids
 
 

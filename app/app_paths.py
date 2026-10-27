@@ -106,3 +106,10 @@ def import_configs_dir() -> Path:
         except OSError:
             pass
     return path
+
+
+def rule_sets_dir() -> Path:
+    path = ensure_app_data_dir() / "rule-sets"
+    path.mkdir(parents=True, exist_ok=True)
+    ensure_user_owned(path)
+    return path

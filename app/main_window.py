@@ -3,16 +3,18 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote
 
 from PySide6.QtCore import QEvent, QSettings, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -41,16 +43,17 @@ from PySide6.QtWidgets import (
 )
 
 from app.app_paths import ensure_user_owned, import_configs_dir, log_path, profiles_path, settings_path
-from app.toast import ToastNotification
 from app.config_parser import ConfigError, Profile, RoutingOptions, load_happ_link, load_profiles, load_profiles_from_text, parse_domains_text
 from app.happ_links import is_happ_link
 from app.latency import profile_latency_ms, probe_active_connection
+from app.xray_bundle import ensure_rule_sets, required_rule_sets
 from app.locations import detect_location, iso_to_flag
 from app.subscriptions import (
     Subscription,
     SubscriptionStore,
     derive_subscription_name,
     fetch_subscription_profiles,
+    format_bytes,
     generate_subscription_id,
     is_likely_subscription_url,
 )
@@ -63,10 +66,12 @@ class ProfileListWidget(QListWidget):
     files_dropped = Signal(list)
     links_dropped = Signal(list)
     items_reordered = Signal(int, int)
+    item_left_clicked = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._drag_row: int | None = None
+        self._press_info: tuple | None = None
         self.setAcceptDrops(True)
         self.setDragEnabled(True)
         self.setDropIndicatorShown(True)
@@ -77,6 +82,22 @@ class ProfileListWidget(QListWidget):
     def startDrag(self, supported_actions) -> None:  # type: ignore[override]
         self._drag_row = self.currentRow()
         super().startDrag(supported_actions)
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            self._press_info = (self.itemAt(event.pos()), event.pos().x(), event.pos().y())
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        super().mouseReleaseEvent(event)
+        info, self._press_info = self._press_info, None
+        if event.button() != Qt.LeftButton or info is None:
+            return
+        press_item, px, py = info
+        item = self.itemAt(event.pos())
+        moved = abs(event.pos().x() - px) + abs(event.pos().y() - py)
+        if item is not None and item is press_item and moved < 8:
+            self.item_left_clicked.emit(item)
 
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]
         if event.mimeData().hasUrls():
@@ -123,12 +144,14 @@ class MainWindow(QMainWindow):
     latencies_ready = Signal(int, list)
     happ_import_finished = Signal(str, object, str)
     subscription_update_finished = Signal(str, object, object, str)
+    # Worker threads must not touch widgets; they log through this queued signal.
+    worker_log = Signal(str)
 
     def __init__(self, initial_link: str | None = None) -> None:
         super().__init__()
         self.setWindowTitle("ambox")
-        self.resize(430, 820)
-        self.setMinimumSize(360, 680)
+        self.resize(460, 840)
+        self.setMinimumSize(360, 620)
         self._app_icon = self._build_app_icon()
         self.setWindowIcon(self._app_icon)
 
@@ -154,6 +177,9 @@ class MainWindow(QMainWindow):
 
         self.subscription_store = SubscriptionStore()
         self._selected_location = "ALL"
+        self._selected_sub_id = ""
+        self._expanded_sub_ids: set[str] = set()
+        self._last_header_toggle = 0.0
         self._subs_dialog: SubscriptionsDialog | None = None
 
         self.vpn = VpnManager()
@@ -168,7 +194,8 @@ class MainWindow(QMainWindow):
         self._setup_notifications()
         self._set_status("disconnected")
         self.vpn.refresh_singbox_availability()
-        self._warn_if_not_running_as_sudo()
+        # Deferred: a modal dialog must not block window construction at startup.
+        QTimer.singleShot(0, self._warn_if_not_running_as_sudo)
         startup_warning = self.vpn.take_startup_warning()
         if startup_warning:
             self.logs.append(f"WARNING: {startup_warning}")
@@ -206,7 +233,7 @@ class MainWindow(QMainWindow):
 
         phone_shell = QFrame()
         phone_shell.setObjectName("phoneShell")
-        phone_shell.setMaximumWidth(520)
+        phone_shell.setMaximumWidth(640)
         phone_layout = QVBoxLayout(phone_shell)
         phone_layout.setContentsMargins(10, 10, 10, 10)
         phone_layout.setSpacing(10)
@@ -235,11 +262,35 @@ class MainWindow(QMainWindow):
         connect_layout = QVBoxLayout(connect_tab)
         connect_layout.setContentsMargins(10, 10, 10, 10)
         connect_layout.setSpacing(10)
+
+        self.vpn_status_card = QFrame()
+        self.vpn_status_card.setObjectName("statusCard")
+        vpn_status_layout = QHBoxLayout(self.vpn_status_card)
+        vpn_status_layout.setContentsMargins(12, 10, 12, 10)
+        vpn_status_layout.setSpacing(8)
+
+        self.status_dot = QLabel("●")
+        self.status_dot.setObjectName("statusDot")
+        vpn_status_layout.addWidget(self.status_dot)
+
+        vpn_status_text = QVBoxLayout()
+        vpn_status_text.setContentsMargins(0, 0, 0, 0)
+        vpn_status_text.setSpacing(1)
+        self.status_label = QLabel("Disconnected")
+        self.status_label.setObjectName("statusLabel")
+        vpn_status_text.addWidget(self.status_label)
+        self.vpn_profile_label = QLabel("No profiles yet")
+        self.vpn_profile_label.setObjectName("softHint")
+        self.vpn_profile_label.setWordWrap(True)
+        vpn_status_text.addWidget(self.vpn_profile_label)
+        vpn_status_layout.addLayout(vpn_status_text, 1)
+        connect_layout.addWidget(self.vpn_status_card)
+
         connect_layout.addStretch(1)
 
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.setObjectName("connectBtn")
-        self.connect_btn.setFixedSize(188, 188)
+        self.connect_btn.setFixedSize(160, 160)
         self.connect_btn.setProperty("vpnState", "disconnected")
         self.connect_btn.clicked.connect(self.toggle_connection)
         connect_layout.addWidget(self.connect_btn, 0, Qt.AlignHCenter)
@@ -261,6 +312,28 @@ class MainWindow(QMainWindow):
         install_layout.addWidget(self.install_btn)
         self.install_card.setVisible(False)
         connect_layout.addWidget(self.install_card)
+
+        self.vpn_empty_frame = QFrame()
+        self.vpn_empty_frame.setObjectName("subCard")
+        vpn_empty_layout = QVBoxLayout(self.vpn_empty_frame)
+        vpn_empty_layout.setContentsMargins(12, 12, 12, 12)
+        vpn_empty_layout.setSpacing(8)
+        vpn_empty_label = QLabel("No profiles yet.\nAdd a subscription or import a config to get started.")
+        vpn_empty_label.setObjectName("emptyState")
+        vpn_empty_label.setAlignment(Qt.AlignCenter)
+        vpn_empty_label.setWordWrap(True)
+        vpn_empty_layout.addWidget(vpn_empty_label)
+        vpn_empty_buttons = QHBoxLayout()
+        vpn_empty_buttons.setSpacing(8)
+        vpn_add_sub_btn = QPushButton("➕ Add subscription")
+        vpn_add_sub_btn.clicked.connect(self.add_subscription_dialog)
+        vpn_paste_btn = QPushButton("Paste clipboard")
+        vpn_paste_btn.clicked.connect(self.import_from_clipboard)
+        vpn_empty_buttons.addWidget(vpn_add_sub_btn)
+        vpn_empty_buttons.addWidget(vpn_paste_btn)
+        vpn_empty_layout.addLayout(vpn_empty_buttons)
+        self.vpn_empty_frame.setVisible(False)
+        connect_layout.addWidget(self.vpn_empty_frame)
 
         connect_layout.addStretch(1)
 
@@ -287,6 +360,11 @@ class MainWindow(QMainWindow):
         self.quick_profile_latency_label = QLabel("Latency update: never")
         self.quick_profile_latency_label.setObjectName("softHint")
         quick_profile_layout.addWidget(self.quick_profile_latency_label)
+
+        self.fastest_btn = QPushButton("⚡ Connect fastest")
+        self.fastest_btn.setToolTip("Connect to the lowest-latency profile (Ctrl+F)")
+        self.fastest_btn.clicked.connect(self._connect_fastest)
+        quick_profile_layout.addWidget(self.fastest_btn)
 
         self.quick_profile_frame.setVisible(False)
         connect_layout.addWidget(self.quick_profile_frame)
@@ -341,12 +419,40 @@ class MainWindow(QMainWindow):
         self.update_subs_btn.clicked.connect(lambda: self.update_all_subscriptions(silent=False))
         profile_filters.addWidget(self.update_subs_btn)
 
-        self.manage_subs_btn = QPushButton("📋 Subscriptions")
+        self.manage_subs_btn = QPushButton("📋 Subs")
         self.manage_subs_btn.setToolTip("Manage subscriptions")
         self.manage_subs_btn.clicked.connect(self.show_subscriptions_dialog)
         profile_filters.addWidget(self.manage_subs_btn)
 
+        self.add_sub_btn = QPushButton("➕")
+        self.add_sub_btn.setToolTip("Add subscription")
+        self.add_sub_btn.setFixedWidth(40)
+        self.add_sub_btn.clicked.connect(self.add_subscription_dialog)
+        profile_filters.addWidget(self.add_sub_btn)
+
         profiles_layout.addLayout(profile_filters)
+
+        self.subs_filter_row = QWidget()
+        subs_filter_layout = QHBoxLayout(self.subs_filter_row)
+        subs_filter_layout.setContentsMargins(0, 0, 0, 0)
+        subs_filter_layout.setSpacing(8)
+        subs_filter_label = QLabel("Sub:")
+        subs_filter_label.setObjectName("softHint")
+        subs_filter_layout.addWidget(subs_filter_label)
+        self.subs_filter_combo = QComboBox()
+        self.subs_filter_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.subs_filter_combo.setMinimumContentsLength(14)
+        self.subs_filter_combo.setToolTip("Filter profiles by subscription")
+        subs_filter_layout.addWidget(self.subs_filter_combo, 1)
+        self.subs_filter_row.setVisible(False)
+        profiles_layout.addWidget(self.subs_filter_row)
+
+        self.profiles_empty_label = QLabel()
+        self.profiles_empty_label.setObjectName("emptyState")
+        self.profiles_empty_label.setAlignment(Qt.AlignCenter)
+        self.profiles_empty_label.setWordWrap(True)
+        self.profiles_empty_label.setVisible(False)
+        profiles_layout.addWidget(self.profiles_empty_label)
 
         self.profile_list = ProfileListWidget()
         self.profile_list.setObjectName("profiles")
@@ -545,6 +651,7 @@ class MainWindow(QMainWindow):
             btn = QPushButton(label)
             btn.setObjectName("navBtn")
             btn.setCheckable(True)
+            btn.setToolTip(f"{label} (Ctrl+{index + 1})")
             btn.clicked.connect(lambda _checked=False, i=index: self._set_bottom_page(i))
             nav_layout.addWidget(btn, 1)
             self.nav_buttons.append(btn)
@@ -552,6 +659,16 @@ class MainWindow(QMainWindow):
         phone_layout.addWidget(bottom_nav)
         self._set_bottom_page(0)
         main.addWidget(phone_shell, 1, Qt.AlignHCenter)
+
+        for index in range(4):
+            shortcut = QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self)
+            shortcut.setContext(Qt.ApplicationShortcut)
+            shortcut.activated.connect(lambda i=index: self._set_bottom_page(i))
+        fastest_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        fastest_shortcut.setContext(Qt.ApplicationShortcut)
+        fastest_shortcut.activated.connect(self._connect_fastest)
+
+        self.statusBar().showMessage("Disconnected")
 
         self.setStyleSheet(
             """
@@ -624,11 +741,29 @@ class MainWindow(QMainWindow):
               background: qradialgradient(cx:0.5, cy:0.5, radius:0.8,
                 fx:0.5, fy:0.5, stop:0 #121620, stop:1 #0c1018);
               border: 2px solid #f0f2f6;
-              border-radius: 94px;
-              font-size: 30px;
+              border-radius: 80px;
+              font-size: 26px;
               font-weight: 700;
               color: #f4f6fa;
               padding: 0;
+            }
+            QFrame#statusCard {
+              background-color: #111621;
+              border: 1px solid #2c3341;
+              border-radius: 10px;
+            }
+            #statusLabel {
+              font-size: 14px;
+              font-weight: 700;
+              color: #eceef2;
+            }
+            #statusDot {
+              font-size: 16px;
+              color: #6b7280;
+            }
+            #emptyState {
+              color: #8f95a3;
+              padding: 8px;
             }
             #connectBtn:hover {
               border: 2px solid #f3b66a;
@@ -916,6 +1051,11 @@ class MainWindow(QMainWindow):
                     filtered.append(idx)
             indices = filtered
 
+        if self._selected_sub_id == "__manual__":
+            indices = [idx for idx in indices if not self.profiles[idx].subscription_id]
+        elif self._selected_sub_id:
+            indices = [idx for idx in indices if self.profiles[idx].subscription_id == self._selected_sub_id]
+
         sort_mode = str(self.profile_sort_combo.currentData() or "manual")
         if sort_mode == "name":
             indices.sort(key=lambda idx: self.profiles[idx].name.lower())
@@ -953,10 +1093,19 @@ class MainWindow(QMainWindow):
 
     def _update_profile_list_capabilities(self) -> None:
         manual_mode = str(self.profile_sort_combo.currentData() or "manual") == "manual"
-        drag_enabled = manual_mode and not self.profile_search_edit.text().strip() and self._selected_location == "ALL"
+        drag_enabled = (
+            manual_mode
+            and not self.profile_search_edit.text().strip()
+            and self._selected_location == "ALL"
+            and not self._selected_sub_id
+        )
         self.profile_list.setDragEnabled(drag_enabled)
         self.profile_list.setDragDropMode(QAbstractItemView.InternalMove if drag_enabled else QAbstractItemView.NoDragDrop)
-        if drag_enabled:
+        if drag_enabled and self._is_grouped_view():
+            self.profile_list_hint.setText(
+                "Click a subscription to expand/collapse it. Drag to reorder within a section. Drop files here to import."
+            )
+        elif drag_enabled:
             self.profile_list_hint.setText(
                 "Right click for actions. Drag to reorder in manual mode. Double click to connect. Drop files here to import."
             )
@@ -965,40 +1114,181 @@ class MainWindow(QMainWindow):
                 "Right click for actions. Drag reorder is available only in manual order without filters. Drop files here to import."
             )
 
+    def _is_grouped_view(self) -> bool:
+        """Grouped view: a manual section plus one collapsible row per subscription.
+
+        Any active filter (search, location, single subscription) switches back
+        to the flat list.
+        """
+        if self.profile_search_edit.text().strip():
+            return False
+        if self._selected_location != "ALL" or self._selected_sub_id:
+            return False
+        return bool(self.subscription_store.all())
+
+    def _selected_sub_header(self) -> str | None:
+        item = self.profile_list.currentItem()
+        if item is None:
+            return None
+        data = item.data(Qt.UserRole)
+        if isinstance(data, tuple) and len(data) == 2 and data[0] == "sub":
+            return str(data[1])
+        return None
+
+    def _select_sub_header(self, sub_id: str) -> None:
+        for row in range(self.profile_list.count()):
+            item = self.profile_list.item(row)
+            if item is not None and item.data(Qt.UserRole) == ("sub", sub_id):
+                self.profile_list.setCurrentRow(row)
+                return
+
+    def _ensure_profile_visible(self, profile_index: int) -> None:
+        """Reveal a profile hidden inside a collapsed subscription (grouped view).
+
+        Call before selecting a profile programmatically: otherwise the
+        selection silently stays on the old row while actions apply to the new
+        profile.
+        """
+        if not 0 <= profile_index < len(self.profiles):
+            return
+        sub_id = self.profiles[profile_index].subscription_id
+        if sub_id and self._is_grouped_view() and sub_id not in self._expanded_sub_ids:
+            self._expanded_sub_ids.add(sub_id)
+            self.settings.setValue("ui/expanded_sub_ids", json.dumps(sorted(self._expanded_sub_ids)))
+            self._rebuild_profile_list(preserve_selection=True)
+
+    def _toggle_sub_expanded(self, sub_id: str) -> None:
+        if sub_id in self._expanded_sub_ids:
+            self._expanded_sub_ids.discard(sub_id)
+        else:
+            self._expanded_sub_ids.add(sub_id)
+        self.settings.setValue("ui/expanded_sub_ids", json.dumps(sorted(self._expanded_sub_ids)))
+        self._rebuild_profile_list(preserve_selection=False)
+        self._select_sub_header(sub_id)
+
+    def _on_profile_item_left_clicked(self, item) -> None:
+        """Single click on a subscription header expands/collapses it."""
+        if item is None:
+            return
+        data = item.data(Qt.UserRole)
+        if not (isinstance(data, tuple) and len(data) == 2 and data[0] == "sub"):
+            return
+        # A double click produces two clicks: debounce so it toggles once.
+        now = time.monotonic()
+        if now - self._last_header_toggle < 0.35:
+            return
+        self._last_header_toggle = now
+        self._toggle_sub_expanded(str(data[1]))
+
+    def _sub_header_text(self, sub: Subscription, node_count: int, expanded: bool) -> str:
+        arrow = "▼" if expanded else "▶"
+        stats = sub.traffic_stats()
+        if not stats.has_data:
+            traffic = ""
+        elif stats.unlimited:
+            traffic = "unlimited" if stats.used <= 0 else f"used {format_bytes(stats.used)} (unlimited)"
+        elif stats.over_quota:
+            traffic = "⚠ over quota"
+        elif stats.remaining is None:
+            traffic = ""
+        else:
+            traffic = f"left {format_bytes(stats.remaining)}"
+        suffix = f"  ·  {traffic}" if traffic else ""
+        return f"{arrow} 📌 {sub.name} ({node_count}){suffix}"
+
+    def _add_profile_row(self, profile_index: int) -> None:
+        item = QListWidgetItem(self._profile_item_text(profile_index))
+        item.setData(Qt.UserRole, profile_index)
+        profile = self.profiles[profile_index]
+        srv = str(profile.outbound.get("server") or "")
+        loc = detect_location(profile.name, srv)
+        latency = self.profile_latencies[profile_index] if profile_index < len(self.profile_latencies) else None
+        tooltip = [profile.name]
+        tooltip.append(f"Location: {loc.flag} {loc.name} ({loc.code})")
+        if profile.subscription_id:
+            sub = self.subscription_store.get(profile.subscription_id)
+            if sub:
+                tooltip.append(f"Subscription: {sub.name}")
+        tooltip.append(f"Latency: {'timeout' if latency is None else f'{latency} ms'}")
+        tooltip.append(f"Traffic: {self._format_bytes(self.profile_usage_bytes[profile_index])}")
+        last_used = self._profile_last_used_timestamp(profile_index)
+        if last_used > 0:
+            tooltip.append(f"Last used: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_used))}")
+        item.setToolTip("\n".join(tooltip))
+        self.profile_list.addItem(item)
+
+    def _add_manual_section_header(self, count: int) -> None:
+        header = QListWidgetItem(f"📁 Manual configs ({count})")
+        header.setData(Qt.UserRole, "manual-header")
+        header.setFlags(Qt.ItemIsEnabled)  # label row, not selectable
+        header.setToolTip("Configs added manually (import / paste)")
+        self.profile_list.addItem(header)
+
+    def _add_sub_section_header(self, sub: Subscription, node_count: int) -> None:
+        expanded = sub.id in self._expanded_sub_ids
+        header = QListWidgetItem(self._sub_header_text(sub, node_count, expanded))
+        header.setData(Qt.UserRole, ("sub", sub.id))
+        summary = sub.userinfo_summary()
+        tooltip = [sub.name, f"Nodes: {node_count}"]
+        tooltip.append(summary if summary else "No traffic info")
+        tooltip.append("Click to " + ("collapse" if expanded else "expand"))
+        header.setToolTip("\n".join(tooltip))
+        self.profile_list.addItem(header)
+
+    def _select_first_selectable_row(self) -> None:
+        for row in range(self.profile_list.count()):
+            item = self.profile_list.item(row)
+            if item is not None and item.flags() & Qt.ItemIsSelectable:
+                self.profile_list.setCurrentRow(row)
+                return
+        self.profile_list.setCurrentRow(-1)
+
     def _rebuild_profile_list(self, preserve_selection: bool = True) -> None:
         selected = self._selected_profile_index() if preserve_selection else None
-        self._visible_profile_indices = self._sorted_profile_indices()
+        selected_sub = self._selected_sub_header() if preserve_selection else None
+        ordered = self._sorted_profile_indices()
+        grouped = self._is_grouped_view()
         self.profile_list.blockSignals(True)
         self.profile_list.clear()
-        for profile_index in self._visible_profile_indices:
-            item = QListWidgetItem(self._profile_item_text(profile_index))
-            item.setData(Qt.UserRole, profile_index)
-            profile = self.profiles[profile_index]
-            srv = str(profile.outbound.get("server") or "")
-            loc = detect_location(profile.name, srv)
-            latency = self.profile_latencies[profile_index] if profile_index < len(self.profile_latencies) else None
-            tooltip = [profile.name]
-            tooltip.append(f"Location: {loc.flag} {loc.name} ({loc.code})")
-            if profile.subscription_id:
-                sub = self.subscription_store.get(profile.subscription_id)
-                if sub:
-                    tooltip.append(f"Subscription: {sub.name}")
-            tooltip.append(f"Latency: {'timeout' if latency is None else f'{latency} ms'}")
-            tooltip.append(f"Traffic: {self._format_bytes(self.profile_usage_bytes[profile_index])}")
-            last_used = self._profile_last_used_timestamp(profile_index)
-            if last_used > 0:
-                tooltip.append(f"Last used: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_used))}")
-            item.setToolTip("\n".join(tooltip))
-            self.profile_list.addItem(item)
+        if grouped:
+            self._visible_profile_indices = []
+            manual = [idx for idx in ordered if not self.profiles[idx].subscription_id]
+            if manual:
+                self._add_manual_section_header(len(manual))
+                for profile_index in manual:
+                    self._add_profile_row(profile_index)
+                    self._visible_profile_indices.append(profile_index)
+            for sub in self.subscription_store.all():
+                nodes = [idx for idx in ordered if self.profiles[idx].subscription_id == sub.id]
+                self._add_sub_section_header(sub, len(nodes))
+                if sub.id in self._expanded_sub_ids:
+                    for profile_index in nodes:
+                        self._add_profile_row(profile_index)
+                        self._visible_profile_indices.append(profile_index)
+        else:
+            self._visible_profile_indices = ordered
+            for profile_index in ordered:
+                self._add_profile_row(profile_index)
         self.profile_list.blockSignals(False)
         self._update_profile_list_capabilities()
 
         if selected is not None:
             self._set_selected_profile_index(selected)
-        elif self.profile_list.count() > 0:
-            self.profile_list.setCurrentRow(0)
+        elif selected_sub is not None:
+            self._select_sub_header(selected_sub)
         else:
-            self.profile_list.setCurrentRow(-1)
+            self._select_first_selectable_row()
+
+        if not self.profiles:
+            self.profiles_empty_label.setText(
+                "No profiles yet.\nAdd a subscription (➕ above), import a file, or paste from clipboard."
+            )
+            self.profiles_empty_label.setVisible(True)
+        elif not self._visible_profile_indices and self.profile_list.count() == 0:
+            self.profiles_empty_label.setText("No profiles match the current search or filters.")
+            self.profiles_empty_label.setVisible(True)
+        else:
+            self.profiles_empty_label.setVisible(False)
 
     def _sync_quick_profile_selector(self) -> None:
         labels = [self._profile_item_text(idx) for idx in range(len(self.profiles))]
@@ -1059,11 +1349,59 @@ class MainWindow(QMainWindow):
             self._selected_location = str(code)
             self._rebuild_profile_list(preserve_selection=True)
 
+    def _refresh_subs_filter(self) -> None:
+        subs = self.subscription_store.all()
+        counts: dict[str, int] = {}
+        manual_count = 0
+        for profile in self.profiles:
+            if profile.subscription_id:
+                counts[profile.subscription_id] = counts.get(profile.subscription_id, 0) + 1
+            else:
+                manual_count += 1
+
+        if self._selected_sub_id and self._selected_sub_id != "__manual__":
+            if not any(sub.id == self._selected_sub_id for sub in subs):
+                self._selected_sub_id = ""
+
+        live_ids = {sub.id for sub in subs}
+        if self._expanded_sub_ids - live_ids:
+            self._expanded_sub_ids &= live_ids
+            self.settings.setValue("ui/expanded_sub_ids", json.dumps(sorted(self._expanded_sub_ids)))
+
+        self.subs_filter_combo.blockSignals(True)
+        self.subs_filter_combo.clear()
+        self.subs_filter_combo.addItem(f"All ({len(self.profiles)})", "")
+        target_index = 0
+        if manual_count:
+            self.subs_filter_combo.addItem(f"📁 Manual imports ({manual_count})", "__manual__")
+            if self._selected_sub_id == "__manual__":
+                target_index = self.subs_filter_combo.count() - 1
+        for sub in subs:
+            count = counts.get(sub.id, sub.profile_count)
+            self.subs_filter_combo.addItem(f"📌 {sub.name} ({count})", sub.id)
+            if sub.id == self._selected_sub_id:
+                target_index = self.subs_filter_combo.count() - 1
+        self.subs_filter_combo.setCurrentIndex(target_index)
+        self.subs_filter_combo.blockSignals(False)
+        self.subs_filter_row.setVisible(bool(subs))
+
+    def _on_subs_filter_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        sub_id = self.subs_filter_combo.currentData()
+        if sub_id is not None and str(sub_id) != self._selected_sub_id:
+            self._selected_sub_id = str(sub_id)
+            self._rebuild_profile_list(preserve_selection=True)
+
     def _refresh_profile_views(self, preserve_selection: bool = True) -> None:
         self._refresh_location_filter()
+        self._refresh_subs_filter()
         self._rebuild_profile_list(preserve_selection=preserve_selection)
         self._sync_quick_profile_selector()
         self._refresh_latency_update_labels()
+        self.vpn_empty_frame.setVisible(not self.profiles)
+        self._update_vpn_profile_label()
+        self._update_status_bar()
 
     def _on_profile_list_row_changed(self, row: int) -> None:
         if row < 0:
@@ -1079,12 +1417,14 @@ class MainWindow(QMainWindow):
         self.quick_profile_combo.blockSignals(True)
         self.quick_profile_combo.setCurrentIndex(profile_index)
         self.quick_profile_combo.blockSignals(False)
+        self._update_vpn_profile_label()
 
     def _on_quick_profile_changed(self, combo_index: int) -> None:
         if combo_index < 0 or combo_index >= len(self.profiles):
             return
         if self._selected_profile_index() == combo_index:
             return
+        self._ensure_profile_visible(combo_index)
         self._set_selected_profile_index(combo_index)
 
     def _build_menu(self) -> None:
@@ -1138,15 +1478,18 @@ class MainWindow(QMainWindow):
         self.profile_list.currentRowChanged.connect(self._on_profile_list_row_changed)
         self.profile_list.customContextMenuRequested.connect(self._show_profile_context_menu)
         self.profile_list.itemDoubleClicked.connect(lambda _item: self._connect_selected_profile())
+        self.profile_list.item_left_clicked.connect(self._on_profile_item_left_clicked)
         self.profile_list.files_dropped.connect(self._import_dropped_files)
         self.profile_list.links_dropped.connect(self._import_dropped_links)
         self.profile_list.items_reordered.connect(self._on_profile_items_reordered)
         self.happ_import_finished.connect(self._on_happ_import_finished)
+        self.worker_log.connect(self._append_log)
         self.subscription_update_finished.connect(self._on_subscription_update_finished)
         self.quick_profile_combo.currentIndexChanged.connect(self._on_quick_profile_changed)
         self.profile_search_edit.textChanged.connect(self._on_profile_filter_changed)
         self.profile_sort_combo.currentIndexChanged.connect(self._on_profile_filter_changed)
         self.profile_location_combo.currentIndexChanged.connect(self._on_location_combo_changed)
+        self.subs_filter_combo.currentIndexChanged.connect(self._on_subs_filter_changed)
         self.copy_logs_btn.clicked.connect(self.copy_logs)
         self.clear_logs_btn.clicked.connect(self.clear_logs)
         self.open_log_file_btn.clicked.connect(self.open_log_file)
@@ -1183,6 +1526,14 @@ class MainWindow(QMainWindow):
         route_domains_text = self.settings.value("route_domains_text", "", type=str) or ""
         usage_raw = self.settings.value("profile_usage_bytes", "{}", type=str) or "{}"
         last_used_raw = self.settings.value("profile_last_used", "{}", type=str) or "{}"
+        expanded_raw = self.settings.value("ui/expanded_sub_ids", "[]", type=str) or "[]"
+        try:
+            parsed_expanded = json.loads(expanded_raw)
+            self._expanded_sub_ids = (
+                {str(x) for x in parsed_expanded} if isinstance(parsed_expanded, list) else set()
+            )
+        except ValueError:
+            self._expanded_sub_ids = set()
         try:
             parsed_usage = json.loads(usage_raw)
             if isinstance(parsed_usage, dict):
@@ -1242,11 +1593,13 @@ class MainWindow(QMainWindow):
             outbound = item.get("outbound")
             if not isinstance(name, str) or not isinstance(outbound, dict):
                 continue
+            xray = item.get("xray")
             loaded.append(
                 Profile(
                     name=name or f"Profile {idx}",
                     outbound=outbound,
                     subscription_id=item.get("subscription_id"),
+                    xray=xray if isinstance(xray, dict) else None,
                 )
             )
 
@@ -1276,6 +1629,7 @@ class MainWindow(QMainWindow):
                     "name": profile.name,
                     "outbound": profile.outbound,
                     "subscription_id": profile.subscription_id,
+                    **({"xray": profile.xray} if profile.xray else {}),
                 }
                 for profile in self.profiles
             ]
@@ -1334,6 +1688,9 @@ class MainWindow(QMainWindow):
         except AttributeError:
             return
         if is_root:
+            return
+        if self.vpn.singbox_has_net_admin():
+            self._append_log("sing-box has CAP_NET_ADMIN; running without sudo.")
             return
 
         message = (
@@ -1400,6 +1757,7 @@ class MainWindow(QMainWindow):
     def _happ_import_worker(self, link: str, source_label: str, custom_name: str = "") -> None:
         try:
             profiles, target_url, headers_info = fetch_subscription_profiles(link)
+            self._prefetch_rule_sets(profiles)
             sub_id = generate_subscription_id(target_url or link)
             sub_name = custom_name.strip() if custom_name else derive_subscription_name(target_url or link, headers_info)
             for p in profiles:
@@ -1414,6 +1772,15 @@ class MainWindow(QMainWindow):
             self.happ_import_finished.emit(source_label, (profiles, meta), "")
         except Exception as exc:
             self.happ_import_finished.emit(source_label, [], str(exc))
+
+    def _prefetch_rule_sets(self, profiles: list[Profile]) -> None:
+        """Runs in worker threads so that connecting a Happ-config profile never waits on downloads."""
+        names: set[tuple[str, str]] = set()
+        for profile in profiles:
+            if profile.xray:
+                names |= required_rule_sets(profile.xray)
+        if names:
+            ensure_rule_sets(names)
 
     def _on_happ_import_finished(self, source_label: str, loaded: object, error: str) -> None:
         if error:
@@ -1517,6 +1884,7 @@ class MainWindow(QMainWindow):
     def _subscription_update_worker(self, sub_id: str, url: str, name: str) -> None:
         try:
             profiles, target_url, headers_info = fetch_subscription_profiles(url)
+            self._prefetch_rule_sets(profiles)
             self.subscription_update_finished.emit(sub_id, profiles, headers_info, "")
         except Exception as exc:
             self.subscription_update_finished.emit(sub_id, [], {}, str(exc))
@@ -1530,6 +1898,11 @@ class MainWindow(QMainWindow):
             return
         if not isinstance(profiles, list) or not profiles:
             self._append_log(f"Subscription '{sub_name}' returned no profiles")
+            # Still persist quota info from the response headers when present.
+            if sub and isinstance(headers_info, dict) and headers_info.get("user_info"):
+                sub.user_info = headers_info["user_info"]
+                sub.updated_at = time.time()
+                self.subscription_store.put(sub)
             self._show_error(f"Subscription '{sub_name}' returned no profiles")
             return
 
@@ -1537,13 +1910,13 @@ class MainWindow(QMainWindow):
         if sub:
             sub.updated_at = time.time()
             sub.profile_count = len(loaded_profiles)
-            if isinstance(headers_info, dict) and "user_info" in headers_info:
+            # Missing/unparseable userinfo must not wipe the previous quota.
+            if isinstance(headers_info, dict) and headers_info.get("user_info"):
                 sub.user_info = headers_info["user_info"]
             self.subscription_store.put(sub)
 
         self._apply_updated_subscription_profiles(sub_id, loaded_profiles)
         self._append_log(f"Updated subscription '{sub_name}': {len(loaded_profiles)} profile(s)")
-        self._notify_user("Subscription updated", f"{sub_name}: {len(loaded_profiles)} profiles loaded")
         if self._subs_dialog and self._subs_dialog.isVisible():
             self._subs_dialog.refresh_list()
 
@@ -1766,6 +2139,7 @@ class MainWindow(QMainWindow):
             name=self._unique_profile_name(f"{source.name} copy"),
             outbound=deepcopy(source.outbound),
             subscription_id=None,
+            xray=deepcopy(source.xray),
         )
         insert_at = index + 1
         self.profiles.insert(insert_at, duplicate)
@@ -1797,7 +2171,9 @@ class MainWindow(QMainWindow):
         if not path_str:
             return
         target = Path(path_str)
-        payload = {"name": profile.name, "outbound": profile.outbound}
+        payload: dict[str, Any] = {"name": profile.name, "outbound": profile.outbound}
+        if profile.xray:
+            payload["xray"] = profile.xray
         try:
             target.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         except OSError as exc:
@@ -1805,6 +2181,19 @@ class MainWindow(QMainWindow):
             return
         self._append_log(f"Exported profile to: {target}")
         self._notify_user("Profile exported", profile.name)
+
+    def _show_sub_header_context_menu(self, sub_id: str, pos) -> None:
+        self._select_sub_header(sub_id)
+        sub = self.subscription_store.get(sub_id)
+        menu = QMenu(self)
+        expanded = sub_id in self._expanded_sub_ids
+        toggle_action = menu.addAction("Collapse" if expanded else "Expand")
+        update_action = menu.addAction(f'Update "{sub.name}"' if sub else "Update subscription")
+        selected_action = menu.exec(self.profile_list.viewport().mapToGlobal(pos))
+        if selected_action is toggle_action:
+            self._toggle_sub_expanded(sub_id)
+        elif selected_action is update_action:
+            self.update_subscription(sub_id)
 
     def _show_profile_context_menu(self, pos) -> None:
         item = self.profile_list.itemAt(pos)
@@ -1822,7 +2211,11 @@ class MainWindow(QMainWindow):
         row = self.profile_list.row(item)
         if row < 0:
             return
-        profile_index = item.data(Qt.UserRole)
+        data = item.data(Qt.UserRole)
+        if isinstance(data, tuple) and len(data) == 2 and data[0] == "sub":
+            self._show_sub_header_context_menu(str(data[1]), pos)
+            return
+        profile_index = data
         if not isinstance(profile_index, int) or profile_index >= len(self.profiles):
             return
         self._set_selected_profile_index(profile_index)
@@ -1888,11 +2281,28 @@ class MainWindow(QMainWindow):
         return profile_index
 
     def _connect_selected_profile(self) -> None:
+        if self._selected_sub_header() is not None:
+            return  # single click already toggled the group; nothing to connect
         index = self._selected_profile_index()
         if index is None:
             self._show_error("Choose a profile first")
             return
         self._connect_profile(index)
+
+    def _connect_fastest(self) -> None:
+        if self.vpn.status in {"connected", "connecting"}:
+            self.vpn.disconnect()
+            return
+        best = self._best_profile_index()
+        if best is None:
+            if not self.profiles:
+                self._show_error("Choose a profile first")
+            elif self._filters_active() and not self._visible_profile_indices:
+                self._show_error("No profiles match the current filters.")
+            else:
+                self._show_error("No latency results yet — press Ping first, then retry.")
+            return
+        self._connect_profile(best)
 
     def toggle_connection(self) -> None:
         if self.vpn.status in {"connected", "connecting"}:
@@ -1927,6 +2337,8 @@ class MainWindow(QMainWindow):
         if self.vpn.status in {"connected", "connecting"}:
             self.vpn.disconnect()
 
+        self._ensure_profile_visible(index)
+        self._set_selected_profile_index(index)
         self.connected_index = index
         self._touch_profile_last_used(index)
         profile = self.profiles[index]
@@ -1989,15 +2401,74 @@ class MainWindow(QMainWindow):
             elif target_index <= self.connected_index < source_index:
                 self.connected_index += 1
 
+    def _group_of(self, profile_index: int) -> str:
+        return self.profiles[profile_index].subscription_id or "__manual__"
+
     def _on_profile_items_reordered(self, old_row: int, new_row: int) -> None:
         manual_mode = str(self.profile_sort_combo.currentData() or "manual") == "manual"
-        if not manual_mode or self.profile_search_edit.text().strip():
+        if (
+            not manual_mode
+            or self.profile_search_edit.text().strip()
+            or self._selected_location != "ALL"
+            or self._selected_sub_id
+        ):
             self._refresh_profile_views()
+            return
+        if self._is_grouped_view():
+            self._reorder_grouped_rows(new_row)
             return
         self._move_profile(old_row, new_row)
         self._save_profiles()
         self._refresh_profile_views()
         self._set_selected_profile_index(new_row)
+        self._append_log("Reordered profiles")
+
+    def _reorder_grouped_rows(self, dropped_row: int) -> None:
+        """Drag-reorder inside one group (manual section or an expanded subscription).
+
+        After an internal move the dragged row sits at ``dropped_row``; the
+        target position is derived from the nearest profile rows around it.
+        Headers cannot move and profiles cannot cross groups: such drops are
+        reverted.
+        """
+        count = self.profile_list.count()
+        if not 0 <= dropped_row < count:
+            self._refresh_profile_views()
+            return
+        dropped_item = self.profile_list.item(dropped_row)
+        source = dropped_item.data(Qt.UserRole) if dropped_item is not None else None
+        if not isinstance(source, int) or not 0 <= source < len(self.profiles):
+            self._refresh_profile_views()
+            return
+
+        def neighbor(step: int) -> int | None:
+            row = dropped_row + step
+            while 0 <= row < count:
+                item = self.profile_list.item(row)
+                data = item.data(Qt.UserRole) if item is not None else None
+                if isinstance(data, int) and 0 <= data < len(self.profiles):
+                    return data
+                row += step
+            return None
+
+        prev_idx, next_idx = neighbor(-1), neighbor(1)
+        group = self._group_of(source)
+        if prev_idx is not None and self._group_of(prev_idx) == group:
+            # Insert right after prev (compensate the pop shift).
+            target = prev_idx - (1 if source < prev_idx else 0) + 1
+        elif next_idx is not None and self._group_of(next_idx) == group:
+            # Insert right before next.
+            target = next_idx - (1 if source < next_idx else 0)
+        else:
+            self._refresh_profile_views()
+            return
+        if target == source:
+            self._refresh_profile_views()
+            return
+        self._move_profile(source, target)
+        self._save_profiles()
+        self._refresh_profile_views()
+        self._set_selected_profile_index(target)
         self._append_log("Reordered profiles")
 
     def refresh_latencies(self) -> None:
@@ -2039,7 +2510,7 @@ class MainWindow(QMainWindow):
                 info = f"{latency} ms"
                 if ip and loc:
                     info += f" | IP: {ip} ({loc})"
-                self._append_log(f"[Probe] Active VPN latency verified: {info}")
+                self.worker_log.emit(f"[Probe] Active VPN latency verified: {info}")
 
     def _on_latencies_ready(self, scan_id: int, latencies: list[int | None]) -> None:
         if scan_id != self._active_scan_id:
@@ -2060,15 +2531,21 @@ class MainWindow(QMainWindow):
         if self._pending_latency_refresh:
             self.refresh_latencies()
 
+    def _filters_active(self) -> bool:
+        return (
+            self._selected_location != "ALL"
+            or bool(self._selected_sub_id)
+            or bool(self.profile_search_edit.text().strip())
+        )
+
     def _best_profile_index(self) -> int | None:
         best_index: int | None = None
         best_latency: int | None = None
 
-        candidate_indices = (
-            self._visible_profile_indices
-            if self._selected_location != "ALL" and self._visible_profile_indices
-            else range(len(self.profiles))
-        )
+        if self._filters_active():
+            candidate_indices: list[int] | range = list(self._visible_profile_indices)
+        else:
+            candidate_indices = range(len(self.profiles))
 
         for idx in candidate_indices:
             if idx >= len(self.profile_latencies):
@@ -2171,28 +2648,24 @@ class MainWindow(QMainWindow):
             info = f"{latency} ms"
             if ip and loc:
                 info += f" | IP: {ip} ({loc})"
-            self._append_log(f"[Probe] Tunnel warm-up successful: {info}")
+            self.worker_log.emit(f"[Probe] Tunnel warm-up successful: {info}")
         else:
             time.sleep(0.8)
             res2 = probe_active_connection(timeout_sec=4.0)
             if res2 and res2.get("ok"):
-                self._append_log(f"[Probe] Tunnel verified: {res2.get('latency_ms')} ms")
+                self.worker_log.emit(f"[Probe] Tunnel verified: {res2.get('latency_ms')} ms")
 
     def _on_vpn_status_changed(self, status: str) -> None:
-        previous = self._last_vpn_status
         self._last_vpn_status = status
         self._set_status(status)
         self._refresh_profile_views()
         if status == "connected" and self.connected_index is not None:
-            ToastNotification("VPN connected", self.profiles[self.connected_index].name, True)
             threading.Thread(target=self._connection_warmup_worker, daemon=True).start()
         elif status == "disconnected":
             self.connected_index = None
             self._timeout_streak = 0
             self._traffic_last_total = None
             self._persist_usage_store(force=True)
-            if previous != "disconnected":
-                ToastNotification("VPN disconnected", "Connection closed", False)
 
     def _set_status(self, status: str) -> None:
         mapping = {
@@ -2201,11 +2674,46 @@ class MainWindow(QMainWindow):
             "connected": ("Connected", "statusConnected", "Stop"),
             "disconnecting": ("Disconnecting...", "statusDisconnecting", "Stop"),
         }
-        button_text = mapping.get(status, (status, "statusDisconnected", "Connect"))[2]
+        status_text, _, button_text = mapping.get(status, (status, "statusDisconnected", "Connect"))
         self.connect_btn.setText(button_text)
         self.connect_btn.setProperty("vpnState", "connected" if status == "connected" else "disconnected")
         self.connect_btn.style().unpolish(self.connect_btn)
         self.connect_btn.style().polish(self.connect_btn)
+        dot_colors = {
+            "disconnected": "#6b7280",
+            "connecting": "#e0a34e",
+            "connected": "#4a9e6a",
+            "disconnecting": "#e0a34e",
+        }
+        self.status_dot.setStyleSheet(f"color: {dot_colors.get(status, '#6b7280')}; font-size: 16px;")
+        self.status_label.setText(status_text)
+        self._update_vpn_profile_label()
+        self._update_status_bar()
+
+    def _update_vpn_profile_label(self) -> None:
+        if not self.profiles:
+            self.vpn_profile_label.setText("No profiles yet")
+            return
+        if self.vpn.status in {"connected", "connecting"} and self.connected_index is not None:
+            index = self.connected_index
+        else:
+            index = self._selected_profile_index()
+        if index is None or index < 0 or index >= len(self.profiles):
+            self.vpn_profile_label.setText(f"{len(self.profiles)} profile(s) available")
+            return
+        profile = self.profiles[index]
+        latency = self.profile_latencies[index] if index < len(self.profile_latencies) else None
+        if not self._latency_has_results:
+            latency_text = "checking..."
+        else:
+            latency_text = "timeout" if latency is None else f"{latency} ms"
+        prefix = "Active: " if self.vpn.status in {"connected", "connecting"} else ""
+        self.vpn_profile_label.setText(f"{prefix}{profile.name} · {latency_text}")
+
+    def _update_status_bar(self) -> None:
+        status_text = self.status_label.text() if hasattr(self, "status_label") else "—"
+        sub_count = len(self.subscription_store.all())
+        self.statusBar().showMessage(f"{status_text} • {len(self.profiles)} profiles • {sub_count} subscriptions")
 
     def copy_logs(self) -> None:
         QApplication.clipboard().setText(self.logs.toPlainText())

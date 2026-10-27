@@ -91,6 +91,42 @@ def test_own_leftover_rule_is_not_reported_as_foreign_vpn(monkeypatch):
     assert "occupied" in ns.detect_foreign_vpn(set())
 
 
+def test_tools_helpers_are_not_reported_as_foreign_vpn(monkeypatch):
+    """`sing-box tools ...` (latency probes) must not block connecting."""
+    procs = {
+        "101": ("sing-box", ["sing-box", "tools", "fetch",
+                             "https://cloudflare.com/cdn-cgi/trace", "-c", "/dev/stdin", "-o", "x"]),
+        "102": ("sing-box", ["sing-box", "run", "-c", "/home/u/.ambox/active-config.json"]),
+        "103": ("python", ["python", "main.py"]),
+    }
+
+    class FakePath:
+        def __init__(self, *parts):
+            self._p = "/".join(parts)
+
+        def _pid(self):
+            return self._p.split("/")[2]
+
+        def read_text(self, encoding="utf-8"):
+            return procs[self._pid()][0] + "\n"
+
+        def read_bytes(self):
+            return "\0".join(procs[self._pid()][1]).encode() + b"\0"
+
+    monkeypatch.setattr(ns.os, "listdir", lambda p: list(procs))
+    monkeypatch.setattr(ns, "Path", FakePath)
+    monkeypatch.setattr(ns, "foreign_default_tun", lambda: [])
+    monkeypatch.setattr(ns, "_ip_lines", lambda *a: [])
+
+    assert ns.find_singbox_pids() == [102]
+    assert "102" in (ns.detect_foreign_vpn(set()) or "")
+    assert ns.detect_foreign_vpn({102}) is None
+
+    del procs["102"]  # only a latency probe left: nothing foreign
+    assert ns.find_singbox_pids() == []
+    assert ns.detect_foreign_vpn(set()) is None
+
+
 def test_reused_owner_pid_is_not_alive(monkeypatch, tmp_path):
     s = ns.NetSession.new(tmp_path / "c.json")
     s.owner_starttime = 100

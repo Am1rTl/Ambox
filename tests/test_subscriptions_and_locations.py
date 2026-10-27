@@ -15,6 +15,7 @@ from app.subscriptions import (
     format_bytes,
     generate_subscription_id,
     is_likely_subscription_url,
+    TrafficStats,
 )
 from app.config_parser import Profile
 
@@ -210,3 +211,85 @@ def test_xray_outbound_vmess_and_trojan_conversion() -> None:
     assert converted_trojan["password"] == "mypassword"
     assert converted_trojan["transport"]["type"] == "grpc"
     assert converted_trojan["transport"]["service_name"] == "trojan-grpc"
+
+
+def _make_sub(user_info) -> Subscription:
+    return Subscription(id="t", name="T", url="https://example.com/sub", user_info=user_info)
+
+
+def test_traffic_stats_basic() -> None:
+    stats = _make_sub({"upload": 1024**3, "download": 4 * 1024**3, "total": 50 * 1024**3}).traffic_stats()
+    assert isinstance(stats, TrafficStats)
+    assert stats.used == 5 * 1024**3
+    assert stats.total == 50 * 1024**3
+    assert stats.remaining == 45 * 1024**3
+    assert stats.percent == pytest.approx(10.0)
+    assert stats.unlimited is False
+    assert stats.over_quota is False
+
+
+def test_traffic_stats_unlimited_total_zero_or_missing() -> None:
+    for info in ({"upload": 100, "download": 200, "total": 0}, {"upload": 100}, {}, {"total": None}):
+        stats = _make_sub(info).traffic_stats()
+        assert stats.unlimited is True
+        assert stats.total is None
+        assert stats.remaining is None
+        assert stats.percent == 0.0
+        assert stats.over_quota is False
+
+
+def test_traffic_stats_has_data_flag() -> None:
+    assert _make_sub({}).traffic_stats().has_data is False
+    assert _make_sub({"upload": 100}).traffic_stats().has_data is True
+    assert _make_sub({"total": None}).traffic_stats().has_data is True
+    assert _make_sub({"total": 1000}).traffic_stats().has_data is True
+
+
+def test_traffic_stats_null_and_string_values() -> None:
+    stats = _make_sub({"upload": None, "download": "1024", "total": "2048", "expire": None}).traffic_stats()
+    assert stats.used == 1024
+    assert stats.total == 2048
+    assert stats.remaining == 1024
+    assert stats.expire == 0
+    assert stats.expire_str == ""
+
+
+def test_traffic_stats_negative_values_clamped() -> None:
+    stats = _make_sub({"upload": -5, "download": -10, "total": -100}).traffic_stats()
+    assert stats.used == 0
+    assert stats.unlimited is True  # non-positive total = unlimited
+
+
+def test_traffic_stats_over_quota() -> None:
+    stats = _make_sub({"upload": 0, "download": 1500, "total": 1000}).traffic_stats()
+    assert stats.over_quota is True
+    assert stats.remaining == 0
+    assert stats.percent == 100.0  # clamped for progress bars
+    assert "over quota" in _make_sub({"download": 1500, "total": 1000}).userinfo_summary()
+
+
+def test_traffic_stats_expiry_and_reset_date() -> None:
+    stats = _make_sub({"total": 1000, "expire": 1800000000}).traffic_stats()
+    assert stats.expire == 1800000000
+    assert stats.expire_str != ""
+    assert "Expires:" in _make_sub({"total": 1000, "expire": 1800000000}).userinfo_summary()
+    no_expire = _make_sub({"total": 1000}).traffic_stats()
+    assert no_expire.expire == 0
+    assert no_expire.expire_str == ""
+
+
+def test_userinfo_summary_unlimited_and_empty() -> None:
+    assert _make_sub({}).userinfo_summary() == ""
+    assert _make_sub({"upload": 500}).userinfo_summary().startswith("Used:")
+    assert "unlimited" in _make_sub({"upload": 500}).userinfo_summary()
+
+
+def test_format_bytes_edge_cases() -> None:
+    assert format_bytes(0) == "0 B"
+    assert format_bytes(None) == "—"
+    assert format_bytes("garbage") == "—"
+    assert format_bytes(-100) == "0 B"
+    assert format_bytes(1023) == "1023 B"
+    assert format_bytes(1024) == "1.0 KB"
+    assert format_bytes(5 * 1024**4) == "5.0 TB"
+    assert format_bytes(8 * 1024**4) == "8.0 TB"  # clamps at TB, no PB unit

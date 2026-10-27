@@ -18,6 +18,8 @@ class Profile:
     name: str
     outbound: dict[str, Any]
     subscription_id: str | None = None
+    # Full Xray config (outbounds + routing + balancers) for Happ-style subscriptions.
+    xray: dict[str, Any] | None = None
 
 
 @dataclass
@@ -45,27 +47,29 @@ def _decode_base64_text(payload: str, context: str) -> str:
         raise ConfigError(f"{context}: invalid base64 payload") from exc
 
 
-def _supports_udp(outbound: dict[str, Any]) -> bool:
+def normalize_outbound(outbound: dict[str, Any]) -> dict[str, Any]:
     """
-    Best-effort check: for TCP-only VLESS/VMess/Trojan links, sing-box cannot proxy UDP
-    unless packet encoding is explicitly enabled.
+    Fix fields written by older versions. In sing-box `network` restricts the outbound to one
+    protocol, so the Xray stream network "tcp" stored there silently disabled UDP (and with it
+    DNS-over-proxy, QUIC and voice calls); trojan has no `packet_encoding` and refuses to start.
     """
-    out_type = str(outbound.get("type", "")).lower()
-    if out_type in {"hysteria2", "hy2", "tuic"}:
-        return True
-
-    network = str(outbound.get("network", "")).lower()
-    packet_encoding = str(outbound.get("packet_encoding", "")).lower()
-    transport_type = str((outbound.get("transport") or {}).get("type", "")).lower()
-
+    out = dict(outbound)
+    out_type = str(out.get("type", "")).lower()
     if out_type in {"vless", "vmess", "trojan"}:
-        if packet_encoding in {"xudp", "packetaddr"}:
-            return True
-        if network == "udp" or transport_type == "quic":
-            return True
-        return False
+        if str(out.get("network", "")).lower() == "tcp":
+            out.pop("network")
+        if out_type == "trojan":
+            out.pop("packet_encoding", None)
+        if out_type == "vless" and str(out.get("flow", "")).startswith("xtls-rprx-vision"):
+            out["flow"] = "xtls-rprx-vision"
+    return out
 
-    return True
+
+def _supports_udp(outbound: dict[str, Any]) -> bool:
+    out_type = str(outbound.get("type", "")).lower()
+    if out_type == "http":
+        return False
+    return str(outbound.get("network", "")).lower() != "tcp"
 
 
 def normalize_domain(value: str) -> str | None:
@@ -179,7 +183,6 @@ def _decode_vmess(uri: str) -> Profile:
         "uuid": uuid,
         "security": "auto",
         "alter_id": 0,
-        "network": "tcp",
         "packet_encoding": "xudp",
     }
     try:
@@ -225,12 +228,11 @@ def _decode_vless(uri: str) -> Profile:
         "server": server,
         "server_port": int(port),
         "uuid": uuid,
-        "network": "tcp",
         "packet_encoding": query.get("packetEncoding", ["xudp"])[0],
     }
     flow = query.get("flow", [""])[0]
     if flow:
-        outbound["flow"] = flow
+        outbound["flow"] = "xtls-rprx-vision" if flow.startswith("xtls-rprx-vision") else flow
 
     transport = _build_transport_from_link(transport_type, query)
     if transport:
@@ -262,8 +264,6 @@ def _decode_trojan(uri: str) -> Profile:
         "server": server,
         "server_port": int(port),
         "password": password,
-        "network": "tcp",
-        "packet_encoding": "xudp",
     }
 
     security = query.get("security", ["tls"])[0]
@@ -507,8 +507,9 @@ def xray_to_singbox_outbound(ob: dict[str, Any]) -> dict[str, Any] | None:
         outbound["server_port"] = port
         outbound["uuid"] = user.get("id") or ""
         outbound["packet_encoding"] = "xudp"
-        if proto == "vless" and user.get("flow"):
-            outbound["flow"] = user.get("flow")
+        flow = str(user.get("flow") or "")
+        if proto == "vless" and flow:
+            outbound["flow"] = "xtls-rprx-vision" if flow.startswith("xtls-rprx-vision") else flow
         if proto == "vmess":
             outbound["security"] = user.get("security") or "auto"
             try:
@@ -521,8 +522,7 @@ def xray_to_singbox_outbound(ob: dict[str, Any]) -> dict[str, Any] | None:
             if "server" in ob and "password" in ob:
                 outbound = dict(ob)
                 outbound["type"] = "trojan"
-                outbound["packet_encoding"] = "xudp"
-                return outbound
+                return normalize_outbound(outbound)
             return None
         target = servers[0]
         server = target.get("address") or ""
@@ -534,7 +534,6 @@ def xray_to_singbox_outbound(ob: dict[str, Any]) -> dict[str, Any] | None:
         outbound["server"] = server
         outbound["server_port"] = port
         outbound["password"] = target.get("password") or ""
-        outbound["packet_encoding"] = "xudp"
     elif proto == "shadowsocks":
         servers = settings.get("servers") or []
         if not servers or not isinstance(servers[0], dict):
@@ -562,16 +561,34 @@ def xray_to_singbox_outbound(ob: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     network = (stream.get("network") or "tcp").lower()
-    outbound["network"] = network if network in {"tcp", "udp"} else "tcp"
+    if network == "h2":
+        network = "http"
+    if network not in {"tcp", "raw", "ws", "http", "httpupgrade", "grpc", "quic"}:
+        # xhttp/splithttp/kcp have no sing-box equivalent; treating them as plain TCP never works.
+        return None
+    tcp_header = ((stream.get("tcpSettings") or stream.get("rawSettings") or {}).get("header") or {}).get("type")
+    if network in {"tcp", "raw"} and tcp_header and tcp_header != "none":
+        return None
 
     if network in {"ws", "http", "httpupgrade"}:
         ws_settings = stream.get(f"{network}Settings") or stream.get("wsSettings") or {}
         transport: dict[str, Any] = {"type": network}
         if ws_settings.get("path"):
             transport["path"] = ws_settings["path"]
-        if ws_settings.get("headers"):
-            transport["headers"] = ws_settings["headers"]
+        headers = dict(ws_settings.get("headers") or {})
+        host = ws_settings.get("host")
+        if isinstance(host, list):
+            host = host[0] if host else ""
+        if host:
+            if network == "http":
+                transport["host"] = [host]
+            else:
+                headers.setdefault("Host", host)
+        if headers:
+            transport["headers"] = headers
         outbound["transport"] = transport
+    elif network == "quic":
+        outbound["transport"] = {"type": "quic"}
     elif network == "grpc":
         grpc_settings = stream.get("grpcSettings") or {}
         transport = {"type": "grpc"}
@@ -589,6 +606,9 @@ def xray_to_singbox_outbound(ob: dict[str, Any]) -> dict[str, Any] | None:
         }
         if sec_settings.get("allowInsecure"):
             tls["insecure"] = True
+        alpn = sec_settings.get("alpn")
+        if isinstance(alpn, list) and alpn:
+            tls["alpn"] = [str(x) for x in alpn]
         fp = sec_settings.get("fingerprint")
         if fp:
             tls["utls"] = {"enabled": True, "fingerprint": fp}
@@ -602,6 +622,17 @@ def xray_to_singbox_outbound(ob: dict[str, Any]) -> dict[str, Any] | None:
         outbound["tls"] = tls
 
     return outbound
+
+
+def _profile_from_xray_config(item: dict[str, Any], name: str) -> Profile | None:
+    from app.xray_bundle import extract_xray_bundle, is_xray_bundle
+
+    for ob in item.get("outbounds") or []:
+        parsed_ob = xray_to_singbox_outbound(ob)
+        if parsed_ob:
+            xray = extract_xray_bundle(item) if is_xray_bundle(item) else None
+            return Profile(name=name or ob.get("tag") or parsed_ob.get("server"), outbound=parsed_ob, xray=xray)
+    return None
 
 
 def _load_profiles_from_text(content: str, allow_happ_links: bool) -> list[Profile]:
@@ -623,12 +654,9 @@ def _load_profiles_from_text(content: str, allow_happ_links: bool) -> list[Profi
                 remarks = item.get("remarks") or item.get("name") or ""
                 raw_outbounds = item.get("outbounds")
                 if isinstance(raw_outbounds, list):
-                    for ob in raw_outbounds:
-                        parsed_ob = xray_to_singbox_outbound(ob)
-                        if parsed_ob:
-                            name = remarks or ob.get("tag") or parsed_ob.get("server") or f"Profile {i}"
-                            profiles.append(Profile(name=name, outbound=parsed_ob))
-                            break
+                    profile = _profile_from_xray_config(item, remarks or f"Profile {i}")
+                    if profile:
+                        profiles.append(profile)
                 else:
                     parsed_ob = xray_to_singbox_outbound(item)
                     if parsed_ob:
@@ -649,11 +677,13 @@ def _load_profiles_from_text(content: str, allow_happ_links: bool) -> list[Profi
                 ob = item.get("outbound")
                 if isinstance(ob, dict):
                     parsed_ob = xray_to_singbox_outbound(ob) or ob
+                    xray = item.get("xray")
                     profiles.append(
                         Profile(
                             name=name or f"Profile {i}",
                             outbound=parsed_ob,
                             subscription_id=item.get("subscription_id"),
+                            xray=xray if isinstance(xray, dict) else None,
                         )
                     )
             if profiles:
@@ -664,6 +694,13 @@ def _load_profiles_from_text(content: str, allow_happ_links: bool) -> list[Profi
             raw_outbounds = data.get("outbounds")
             if not isinstance(raw_outbounds, list):
                 raise ConfigError("json outbounds must be a list")
+            from app.xray_bundle import is_xray_bundle
+
+            if is_xray_bundle(data):
+                profile = _profile_from_xray_config(data, str(data.get("remarks") or "Profile 1"))
+                if profile is None:
+                    raise ConfigError("no usable outbounds in json")
+                return [profile]
             for i, outbound in enumerate(raw_outbounds, start=1):
                 if not isinstance(outbound, dict):
                     continue
@@ -772,7 +809,20 @@ def _direct_dns_server() -> dict[str, Any]:
     }
 
 
-def build_singbox_config(outbound: dict[str, Any], routing: RoutingOptions | None = None) -> dict[str, Any]:
+def convert_bundle_outbound(ob: dict[str, Any]) -> dict[str, Any] | None:
+    converted = xray_to_singbox_outbound(ob)
+    return normalize_outbound(converted) if converted else None
+
+
+def build_singbox_config(
+    outbound: dict[str, Any],
+    routing: RoutingOptions | None = None,
+    xray: dict[str, Any] | None = None,
+    rule_set_available: Callable[[str, str], bool] | None = None,
+    unavailable: set[str] | None = None,
+) -> dict[str, Any]:
+    from app.xray_bundle import cached_rule_set_available, convert_xray_bundle, rule_set_path
+
     routing = routing or RoutingOptions()
     mode = routing.mode if routing.mode in {"all", "only_selected", "all_except_selected"} else "all"
     dns_mode = routing.dns_mode if routing.dns_mode in {"proxy", "direct", "custom"} else "proxy"
@@ -783,16 +833,34 @@ def build_singbox_config(outbound: dict[str, Any], routing: RoutingOptions | Non
     rules: list[dict[str, Any]] = [{"action": "sniff"}]
     dns_config: dict[str, Any] | None = None
     default_domain_resolver: str | None = None
-    proxy_outbound = dict(outbound)
-    raw_proxy_tag = str(proxy_outbound.get("tag") or "proxy").strip()
-    proxy_tag = raw_proxy_tag if raw_proxy_tag and raw_proxy_tag not in {"direct", "block"} else "proxy"
-    proxy_outbound["tag"] = proxy_tag
+    bundle = None
+    if xray:
+        try:
+            bundle = convert_xray_bundle(
+                xray,
+                convert_bundle_outbound,
+                rule_set_available or cached_rule_set_available,
+                unavailable or frozenset(),
+            )
+        except ValueError:
+            bundle = None
+    if bundle is not None:
+        proxy_outbounds = bundle.outbounds
+        proxy_tag = bundle.main_tag
+        bundle_final = bundle.final_tag
+    else:
+        proxy_outbound = normalize_outbound(outbound)
+        raw_proxy_tag = str(proxy_outbound.get("tag") or "proxy").strip()
+        proxy_tag = raw_proxy_tag if raw_proxy_tag and raw_proxy_tag not in {"direct", "block"} else "proxy"
+        proxy_outbound["tag"] = proxy_tag
+        proxy_outbounds = [proxy_outbound]
+        bundle_final = proxy_tag
     outbounds: list[dict[str, Any]] = [
-        proxy_outbound,
+        *proxy_outbounds,
         {"type": "direct", "tag": "direct"},
         {"type": "block", "tag": "block"},
     ]
-    final_outbound = proxy_tag
+    final_outbound = bundle_final
 
     if dns_mode == "custom":
         if not custom_dns:
@@ -868,15 +936,15 @@ def build_singbox_config(outbound: dict[str, Any], routing: RoutingOptions | Non
     if routing.ignore_ru_domains:
         rules.append({"domain_suffix": [RU_DOMAIN_SUFFIX], "outbound": "direct"})
         if dns_mode == "proxy" and dns_config is not None:
-            dns_config["servers"].append(_direct_dns_server())
             dns_config["rules"] = [
                 {"domain_suffix": [RU_DOMAIN_SUFFIX], "action": "route", "server": "direct-dns"}
             ]
 
+    udp_ok = bundle is not None or _supports_udp(proxy_outbounds[0])
     if mode == "only_selected":
         final_outbound = "direct"
         if domains:
-            if _supports_udp(outbound):
+            if udp_ok:
                 rules.append({rule_key: domains, "outbound": proxy_tag})
             else:
                 # TCP-only proxies cannot carry UDP. Keep non-selected traffic direct and
@@ -884,11 +952,15 @@ def build_singbox_config(outbound: dict[str, Any], routing: RoutingOptions | Non
                 rules.append({rule_key: domains, "network": ["udp"], "outbound": "block"})
                 rules.append({rule_key: domains, "outbound": proxy_tag})
     elif mode == "all_except_selected":
-        final_outbound = proxy_tag
         if domains:
             rules.append({rule_key: domains, "outbound": "direct"})
 
-    if not _supports_udp(outbound) and mode in {"all", "all_except_selected"}:
+    if bundle is not None and mode != "only_selected":
+        # The provider's own routing (per-service nodes, balancers, direct lists) comes after the
+        # user's exceptions above.
+        rules.extend(bundle.rules)
+
+    if not udp_ok and mode in {"all", "all_except_selected"}:
         # Prevent endless UDP retry errors for TCP-only links (e.g. QUIC traffic).
         # This rule is intentionally placed after domain exceptions above.
         rules.append({"network": ["udp"], "outbound": "block"})
@@ -916,6 +988,11 @@ def build_singbox_config(outbound: dict[str, Any], routing: RoutingOptions | Non
         },
         "outbounds": outbounds,
     }
+    if bundle is not None and mode != "only_selected" and bundle.rule_sets:
+        config["route"]["rule_set"] = [
+            {"type": "local", "tag": tag, "format": "binary", "path": str(rule_set_path(kind, name))}
+            for tag, (kind, name) in sorted(bundle.rule_sets.items())
+        ]
     if default_domain_resolver:
         config["route"]["default_domain_resolver"] = default_domain_resolver
     if dns_config is not None:

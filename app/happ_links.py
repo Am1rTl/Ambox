@@ -120,6 +120,37 @@ def unwrap_happ_link(value: str) -> str:
     raise HappLinkError("too many nested Happ links")
 
 
+_SIZE_SUFFIXES = {
+    "": 1,
+    "b": 1,
+    "k": 1024,
+    "kb": 1024,
+    "m": 1024**2,
+    "mb": 1024**2,
+    "g": 1024**3,
+    "gb": 1024**3,
+    "t": 1024**4,
+    "tb": 1024**4,
+}
+
+
+def _parse_userinfo_number(value: str) -> int | None:
+    """Parse ints, floats and size-suffixed values (e.g. '10GB', '1.5 mb')."""
+    text = value.strip().lower().replace(" ", "")
+    if not text:
+        return None
+    match = re.match(r"^([+-]?\d+(?:\.\d+)?)([a-z]*)$", text)
+    if not match:
+        return None
+    number, suffix = match.groups()
+    if suffix not in _SIZE_SUFFIXES:
+        return None
+    try:
+        return int(float(number) * _SIZE_SUFFIXES[suffix])
+    except ValueError:
+        return None
+
+
 def parse_subscription_userinfo(header_value: str) -> dict[str, int]:
     result: dict[str, int] = {}
     if not header_value:
@@ -130,8 +161,11 @@ def parse_subscription_userinfo(header_value: str) -> dict[str, int]:
             k, v = part.split("=", 1)
             k = k.strip().lower()
             v = v.strip()
-            if v.isdigit():
-                result[k] = int(v)
+            if not k:
+                continue
+            number = _parse_userinfo_number(v)
+            if number is not None:
+                result[k] = number
     return result
 
 
