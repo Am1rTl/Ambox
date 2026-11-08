@@ -11,6 +11,7 @@ from app.config_parser import (
     load_happ_link,
     load_profiles_from_text,
     parse_domains_text,
+    parse_route_targets,
 )
 
 
@@ -194,6 +195,14 @@ def test_parse_domains_text_deduplicates_and_normalizes() -> None:
     assert domains == ["example.com", "sub.example.com"]
 
 
+def test_parse_route_targets_separates_ip_addresses_and_cidrs() -> None:
+    domains, ip_cidrs = parse_route_targets(
+        "*.Example.com\n213.136.80.131\n2001:db8::1\n192.0.2.0/24\n213.136.80.131"
+    )
+    assert domains == ["example.com"]
+    assert ip_cidrs == ["213.136.80.131/32", "2001:db8::1/128", "192.0.2.0/24"]
+
+
 def test_build_singbox_config_custom_dns() -> None:
     profiles = load_profiles_from_text("socks://user:pass@example.com:1080#SocksNode")
     config = build_singbox_config(
@@ -202,6 +211,22 @@ def test_build_singbox_config_custom_dns() -> None:
     )
     assert config["route"]["final"] == "proxy"
     assert config["dns"]["final"] == "proxy-dns"
+
+
+def test_build_singbox_config_uses_local_direct_dns_and_tcp_proxy_dns() -> None:
+    config = build_singbox_config(
+        {"type": "socks", "tag": "proxy", "server": "1.2.3.4", "server_port": 1080},
+        RoutingOptions(dns_mode="direct"),
+    )
+    assert config["dns"]["servers"] == [{"tag": "direct-dns", "type": "local"}]
+
+    proxy_config = build_singbox_config(
+        {"type": "http", "tag": "proxy", "server": "1.2.3.4", "server_port": 8080},
+        RoutingOptions(dns_mode="proxy"),
+    )
+    proxy_dns = next(server for server in proxy_config["dns"]["servers"] if server["tag"] == "proxy-dns")
+    assert proxy_dns["type"] == "tcp"
+    assert proxy_dns["detour"] == "proxy"
 
 
 def test_build_singbox_config_can_ignore_ru_domains() -> None:
@@ -220,6 +245,30 @@ def test_build_singbox_config_can_ignore_ru_domains() -> None:
     assert {"domain_suffix": [".ru"], "action": "route", "server": "direct-dns"} in config["dns"]["rules"]
 
 
+def test_build_singbox_config_routes_selected_ip_cidrs() -> None:
+    config = build_singbox_config(
+        {"type": "socks", "tag": "proxy", "server": "1.2.3.4", "server_port": 1080},
+        RoutingOptions(mode="only_selected", ip_cidrs=["203.0.113.10/32", "2001:db8::/64"]),
+    )
+    assert {"ip_cidr": ["203.0.113.10/32", "2001:db8::/64"], "outbound": "proxy"} in config["route"]["rules"]
+
+    legacy_config = build_singbox_config(
+        {"type": "socks", "tag": "proxy", "server": "1.2.3.4", "server_port": 1080},
+        RoutingOptions(mode="only_selected", domains=["203.0.113.10"]),
+    )
+    assert {"ip_cidr": ["203.0.113.10/32"], "outbound": "proxy"} in legacy_config["route"]["rules"]
+
+
+def test_build_singbox_config_custom_dns_accepts_bare_ipv6() -> None:
+    config = build_singbox_config(
+        {"type": "socks", "tag": "proxy", "server": "1.2.3.4", "server_port": 1080},
+        RoutingOptions(dns_mode="custom", custom_dns="2001:4860:4860::8888"),
+    )
+    custom = next(server for server in config["dns"]["servers"] if server["tag"] == "custom-dns")
+    assert custom["server"] == "2001:4860:4860::8888"
+    assert custom["domain_resolver"] == "direct-dns"
+
+
 def test_build_singbox_config_keeps_localhost_direct() -> None:
     profiles = load_profiles_from_text("socks://user:pass@example.com:1080#SocksNode")
 
@@ -235,3 +284,75 @@ def test_build_singbox_config_keeps_localhost_direct() -> None:
         assert localhost_rule in rules
         assert loopback_rule in rules
         assert rules.index(localhost_rule) < rules.index(loopback_rule)
+
+
+def test_build_singbox_config_routes_proxy_server_ip_direct() -> None:
+    profiles = load_profiles_from_text(
+        "vless://ace3a7da-2422-474b-97a2-2fc5d51883c1@176.98.176.73:8080?security=tls#TestIP"
+    )
+    config = build_singbox_config(profiles[0].outbound)
+    rules = config["route"]["rules"]
+
+    server_ip_rule = {"ip_cidr": ["176.98.176.73/32"], "outbound": "direct"}
+    loopback_rule = {"ip_cidr": ["127.0.0.0/8", "::1/128"], "outbound": "direct"}
+
+    assert server_ip_rule in rules
+    assert rules.index(loopback_rule) < rules.index(server_ip_rule)
+
+
+def test_build_singbox_config_routes_proxy_server_domain_direct() -> None:
+    profiles = load_profiles_from_text("trojan://secret@proxy.example.com:443?security=tls#TestDomain")
+    config = build_singbox_config(profiles[0].outbound)
+    rules = config["route"]["rules"]
+
+    server_domain_rule = {"domain": ["proxy.example.com"], "outbound": "direct"}
+    loopback_rule = {"ip_cidr": ["127.0.0.0/8", "::1/128"], "outbound": "direct"}
+
+    assert server_domain_rule in rules
+    assert rules.index(loopback_rule) < rules.index(server_domain_rule)
+
+
+def test_build_singbox_config_routes_proxy_server_ipv6_direct() -> None:
+    outbound = {
+        "type": "vless",
+        "tag": "proxy",
+        "server": "2001:db8::1",
+        "server_port": 443,
+        "uuid": "11111111-1111-1111-1111-111111111111",
+    }
+    config = build_singbox_config(outbound)
+    rules = config["route"]["rules"]
+
+    server_ip_rule = {"ip_cidr": ["2001:db8::1/128"], "outbound": "direct"}
+    assert server_ip_rule in rules
+
+
+def test_build_singbox_config_routes_bundle_standby_and_unavailable_nodes_direct() -> None:
+    xray = {
+        "outbounds": [
+            {
+                "tag": "node-active",
+                "protocol": "vless",
+                "settings": {"vnext": [{"address": "198.51.100.1", "port": 443, "users": [{"id": "uuid"}]}]},
+            },
+            {
+                "tag": "node-unavailable",
+                "protocol": "vless",
+                "settings": {"vnext": [{"address": "198.51.100.2", "port": 443, "users": [{"id": "uuid"}]}]},
+            },
+            {
+                "tag": "node-domain",
+                "protocol": "trojan",
+                "settings": {"servers": [{"address": "standby.example.com", "port": 443, "password": "pass"}]},
+            },
+        ],
+    }
+    config = build_singbox_config(
+        {"type": "vless", "server": "198.51.100.1"},
+        xray=xray,
+        unavailable={"node-unavailable"},
+    )
+    rules = config["route"]["rules"]
+
+    assert {"domain": ["standby.example.com"], "outbound": "direct"} in rules
+    assert {"ip_cidr": ["198.51.100.1/32", "198.51.100.2/32"], "outbound": "direct"} in rules

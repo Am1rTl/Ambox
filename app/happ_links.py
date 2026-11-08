@@ -12,6 +12,14 @@ from app.happ_crypto import HappCryptoError, decrypt_happ_payload
 
 MAX_SUBSCRIPTION_BYTES = 8 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 20
+
+# HWID из запатченного Happ: clone/happ/apktool_base/smali/dq7.smali, метод j()
+# Оригинал возвращает Settings.Secure ANDROID_ID, патч — константу ниже.
+HAPP_HWID = "cafebabecafebabe"
+HAPP_DEVICE_OS = "Android"
+HAPP_VER_OS = "14"
+HAPP_DEVICE_MODEL = "Pixel 8"
+HAPP_DEVICE_LOCALE = "en"
 _LINK_PREFIX = "happ://"
 _ALLOWED_ACTIONS = {"add", "import", "sub", "subscribe", "subscription", "install"}
 _SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
@@ -169,7 +177,11 @@ def parse_subscription_userinfo(header_value: str) -> dict[str, int]:
     return result
 
 
-def fetch_subscription_with_info(url: str, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> tuple[str, dict[str, Any]]:
+def fetch_subscription_with_info(
+    url: str,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    hwid: str | None = None,
+) -> tuple[str, dict[str, Any]]:
     parsed = urlparse(url)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise HappLinkError("subscription target must be an HTTP(S) URL")
@@ -180,6 +192,12 @@ def fetch_subscription_with_info(url: str, timeout: int = DEFAULT_TIMEOUT_SECOND
             "Accept": "application/json, text/plain, */*",
             "Accept-Encoding": "identity",
             "User-Agent": "Happ/1.0.0 (Linux; Ambox/1.0) v2rayN/6.23 sing-box/1.8.0",
+            "Connection": "close",
+            "X-HWID": hwid or HAPP_HWID,
+            "X-Device-OS": HAPP_DEVICE_OS,
+            "X-Ver-OS": HAPP_VER_OS,
+            "X-Device-model": HAPP_DEVICE_MODEL,
+            "X-Device-Locale": HAPP_DEVICE_LOCALE,
         },
     )
     headers_dict: dict[str, Any] = {}
@@ -229,6 +247,10 @@ def fetch_subscription_with_info(url: str, timeout: int = DEFAULT_TIMEOUT_SECOND
     return text, headers_dict
 
 
-def fetch_subscription(url: str, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> str:
-    text, _ = fetch_subscription_with_info(url, timeout=timeout)
+def fetch_subscription(
+    url: str,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    hwid: str | None = None,
+) -> str:
+    text, _ = fetch_subscription_with_info(url, timeout=timeout, hwid=hwid)
     return text

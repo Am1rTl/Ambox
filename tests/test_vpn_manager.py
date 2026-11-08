@@ -88,3 +88,44 @@ def test_new_version_produces_no_warning(monkeypatch, vpn):
     monkeypatch.setattr(vpn, "singbox_version", lambda: (1, 14, 0))
     warnings = vpn.environment_warnings()
     assert not any("minimum supported" in w for w in warnings)
+
+
+def test_custom_dns_parser_accepts_bare_ipv6_and_rejects_bad_ports(vpn):
+    assert vpn._parse_custom_dns_target("2001:4860:4860::8888") == (
+        "udp",
+        "2001:4860:4860::8888",
+        53,
+    )
+    assert vpn._parse_custom_dns_target("tcp://[2001:4860:4860::8888]:5353") == (
+        "tcp",
+        "2001:4860:4860::8888",
+        5353,
+    )
+    assert vpn._parse_custom_dns_target("udp://2001:4860:4860::8888") == (
+        "udp",
+        "2001:4860:4860::8888",
+        53,
+    )
+    with pytest.raises(ValueError, match="port"):
+        vpn._parse_custom_dns_target("dns.google:99999")
+
+
+def test_custom_dns_probe_tries_all_resolved_addresses(monkeypatch, vpn):
+    monkeypatch.setattr(
+        vpn,
+        "_resolve_dns_target",
+        lambda host, port, socktype: [
+            (2, ("192.0.2.1", port), "192.0.2.1"),
+            (10, ("2001:db8::1", port, 0, 0), "2001:db8::1"),
+        ],
+    )
+    attempts = []
+
+    def probe(scheme, family, sockaddr):
+        attempts.append((family, sockaddr))
+        if family == 2:
+            raise OSError("unreachable")
+
+    monkeypatch.setattr(vpn, "_probe_dns_server", probe)
+    assert vpn._prepare_custom_dns("dns.example") == "udp://[2001:db8::1]:53"
+    assert len(attempts) == 2

@@ -44,7 +44,15 @@ from PySide6.QtWidgets import (
 )
 
 from app.app_paths import ensure_user_owned, import_configs_dir, log_path, profiles_path, settings_path
-from app.config_parser import ConfigError, Profile, RoutingOptions, load_happ_link, load_profiles, load_profiles_from_text, parse_domains_text
+from app.config_parser import (
+    ConfigError,
+    Profile,
+    RoutingOptions,
+    load_happ_link,
+    load_profiles,
+    load_profiles_from_text,
+    parse_route_targets,
+)
 from app.happ_links import is_happ_link
 from app.latency import MAX_PROBE_WORKERS, profile_latency_ms, probe_active_connection
 from app.xray_bundle import ensure_rule_sets, required_rule_sets
@@ -553,12 +561,12 @@ class MainWindow(QMainWindow):
         self.route_mode_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.route_mode_combo.setMinimumContentsLength(16)
         self.route_mode_combo.addItem("Proxy all traffic", "all")
-        self.route_mode_combo.addItem("Proxy only listed domains", "only_selected")
-        self.route_mode_combo.addItem("Proxy all except listed domains", "all_except_selected")
+        self.route_mode_combo.addItem("Proxy only listed domains/IPs", "only_selected")
+        self.route_mode_combo.addItem("Proxy all except listed domains/IPs", "all_except_selected")
         settings_layout.addWidget(route_label)
         settings_layout.addWidget(self.route_mode_combo)
 
-        self.routing_mode_hint = QLabel("Domain rules are ignored when 'Proxy all traffic' is selected.")
+        self.routing_mode_hint = QLabel("Domain and IP rules are ignored when 'Proxy all traffic' is selected.")
         self.routing_mode_hint.setWordWrap(True)
         self.routing_mode_hint.setObjectName("softHint")
         settings_layout.addWidget(self.routing_mode_hint)
@@ -578,7 +586,7 @@ class MainWindow(QMainWindow):
 
         self.domains_edit = QPlainTextEdit()
         self.domains_edit.setObjectName("domains")
-        self.domains_edit.setPlaceholderText("chatgpt.com\nyoutube.com")
+        self.domains_edit.setPlaceholderText("chatgpt.com\nyoutube.com\n203.0.113.10 or 203.0.113.0/24")
         self.domains_edit.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         self.domains_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.domains_edit.setMinimumHeight(96)
@@ -1762,7 +1770,7 @@ class MainWindow(QMainWindow):
         self.routing_domains_frame.setVisible(needs_domains)
         self.routing_mode_hint.setVisible(needs_domains)
         if needs_domains:
-            self.routing_mode_hint.setText("Routing uses the domain list below in this mode.")
+            self.routing_mode_hint.setText("Routing uses the domain and IP/CIDR list below in this mode.")
         else:
             self.routing_mode_hint.setText("")
 
@@ -2437,8 +2445,8 @@ class MainWindow(QMainWindow):
             return
 
         routing = self._routing_options()
-        if routing.mode == "only_selected" and not routing.domains:
-            self._show_error("Add at least one domain for 'Proxy only listed domains' mode.")
+        if routing.mode == "only_selected" and not (routing.domains or routing.ip_cidrs):
+            self._show_error("Add at least one domain or IP/CIDR for 'Proxy only listed domains/IPs' mode.")
             return
         if routing.dns_mode == "custom" and not routing.custom_dns.strip():
             self._show_error("Enter a Custom DNS server address.")
@@ -2458,7 +2466,7 @@ class MainWindow(QMainWindow):
 
     def _routing_options(self) -> RoutingOptions:
         mode = str(self.route_mode_combo.currentData() or "all")
-        domains = parse_domains_text(self.domains_edit.toPlainText())
+        domains, ip_cidrs = parse_route_targets(self.domains_edit.toPlainText())
         return RoutingOptions(
             mode=mode,
             dns_mode=str(self.dns_mode_combo.currentData() or "proxy"),
@@ -2466,6 +2474,7 @@ class MainWindow(QMainWindow):
             include_subdomains=self.include_subdomains_checkbox.isChecked(),
             ignore_ru_domains=self.ignore_ru_domains_checkbox.isChecked(),
             domains=domains,
+            ip_cidrs=ip_cidrs,
         )
 
     def _on_profile_filter_changed(self) -> None:

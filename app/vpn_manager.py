@@ -99,22 +99,45 @@ class VpnManager(QObject):
             raise ValueError("Custom DNS server is empty.")
 
         if "://" in raw:
-            parsed = urlparse(raw)
-            scheme = (parsed.scheme or "").lower()
+            scheme, target = raw.split("://", 1)
+            scheme = scheme.lower()
             if scheme not in {"udp", "tcp"}:
                 raise ValueError("Custom DNS supports only udp:// or tcp:// addresses.")
-            host = parsed.hostname
+            try:
+                host = str(ip_address(target))
+                parsed = None
+            except ValueError:
+                parsed = urlparse(raw)
+                host = parsed.hostname
+            if (
+                not host
+                or (parsed is not None and parsed.path not in {"", "/"})
+                or (parsed is not None and parsed.query)
+                or (parsed is not None and parsed.fragment)
+                or (parsed is not None and parsed.username)
+                or (parsed is not None and parsed.password)
+            ):
+                raise ValueError("Custom DNS address is invalid.")
+        else:
+            # urlparse treats a bare IPv6 address as a host followed by an
+            # invalid port. Recognize it before parsing host:port syntax.
+            try:
+                host = str(ip_address(raw))
+                return "udp", host, 53
+            except ValueError:
+                parsed = urlparse(f"//{raw}")
+                scheme = "udp"
+                host = parsed.hostname
             if not host:
                 raise ValueError("Custom DNS address is invalid.")
-            port = parsed.port or 53
-            return scheme, host, port
 
-        parsed = urlparse(f"//{raw}")
-        host = parsed.hostname
-        if not host:
-            raise ValueError("Custom DNS address is invalid.")
-        port = parsed.port or 53
-        return "udp", host, port
+        try:
+            port = parsed.port if parsed is not None and parsed.port is not None else 53
+        except ValueError as exc:
+            raise ValueError("Custom DNS port is invalid.") from exc
+        if not 1 <= port <= 65535:
+            raise ValueError("Custom DNS port is invalid.")
+        return scheme, host, port
 
     def _dns_query_packet(self) -> tuple[bytes, bytes]:
         query_id = os.urandom(2)
@@ -134,7 +157,7 @@ class VpnManager(QObject):
             remaining -= len(data)
         return b"".join(chunks)
 
-    def _resolve_dns_target(self, host: str, port: int, socktype: int) -> tuple[int, tuple, str]:
+    def _resolve_dns_target(self, host: str, port: int, socktype: int) -> list[tuple[int, tuple, str]]:
         try:
             infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socktype)
         except socket.gaierror as exc:
@@ -145,8 +168,15 @@ class VpnManager(QObject):
             raise ValueError(f"Cannot resolve Custom DNS host '{host}'.")
 
         infos = sorted(infos, key=lambda item: 0 if item[0] == socket.AF_INET else 1)
-        family, _socktype, _proto, _canonname, sockaddr = infos[0]
-        return family, sockaddr, sockaddr[0]
+        targets: list[tuple[int, tuple, str]] = []
+        seen: set[tuple[int, tuple]] = set()
+        for family, _socktype, _proto, _canonname, sockaddr in infos:
+            key = (family, sockaddr)
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append((family, sockaddr, sockaddr[0]))
+        return targets
 
     def _probe_dns_server(self, scheme: str, family: int, sockaddr: tuple, timeout: float = 2.0) -> None:
         query, query_id = self._dns_query_packet()
@@ -155,7 +185,7 @@ class VpnManager(QObject):
                 sock.settimeout(timeout)
                 sock.sendto(query, sockaddr)
                 response, _ = sock.recvfrom(2048)
-            if len(response) < 12 or response[:2] != query_id:
+            if len(response) < 12 or response[:2] != query_id or not (response[2] & 0x80):
                 raise OSError("invalid dns response")
             return
 
@@ -167,28 +197,34 @@ class VpnManager(QObject):
             length_data = self._recv_exact(sock, 2)
             payload_len = int.from_bytes(length_data, "big")
             response = self._recv_exact(sock, payload_len)
-        if len(response) < 12 or response[:2] != query_id:
+        if len(response) < 12 or response[:2] != query_id or not (response[2] & 0x80):
             raise OSError("invalid dns response")
 
     def _prepare_custom_dns(self, value: str) -> str:
         scheme, host, port = self._parse_custom_dns_target(value)
         socktype = socket.SOCK_DGRAM if scheme == "udp" else socket.SOCK_STREAM
-        family, sockaddr, resolved_ip = self._resolve_dns_target(host, port, socktype)
-        try:
-            self._probe_dns_server(scheme, family, sockaddr)
-        except OSError as exc:
-            raise ValueError(
-                f"Custom DNS server '{host}:{port}' is not responding to DNS queries."
-            ) from exc
+        targets = self._resolve_dns_target(host, port, socktype)
+        last_error: OSError | None = None
+        for family, sockaddr, resolved_ip in targets:
+            try:
+                self._probe_dns_server(scheme, family, sockaddr)
+            except OSError as exc:
+                last_error = exc
+                continue
 
-        try:
-            ip_address(resolved_ip)
-        except ValueError:
-            raise ValueError(f"Resolved Custom DNS address is invalid: {resolved_ip}")
+            try:
+                ip_address(resolved_ip)
+            except ValueError:
+                last_error = OSError(f"invalid resolved address: {resolved_ip}")
+                continue
 
-        if ":" in resolved_ip:
-            return f"{scheme}://[{resolved_ip}]:{port}"
-        return f"{scheme}://{resolved_ip}:{port}"
+            if ":" in resolved_ip:
+                return f"{scheme}://[{resolved_ip}]:{port}"
+            return f"{scheme}://{resolved_ip}:{port}"
+
+        raise ValueError(
+            f"Custom DNS server '{host}:{port}' is not responding to DNS queries."
+        ) from last_error
 
     def _detect_external_conflict(self) -> str | None:
         warning = net_session.reconcile_stale_session()

@@ -1,5 +1,6 @@
 import base64
 import binascii
+import ipaddress
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,6 +31,7 @@ class RoutingOptions:
     dns_mode: str = "proxy"
     custom_dns: str = ""
     domains: list[str] = field(default_factory=list)
+    ip_cidrs: list[str] = field(default_factory=list)
 
 
 class ConfigError(Exception):
@@ -84,6 +86,16 @@ def normalize_domain(value: str) -> str | None:
     raw = raw.strip(".")
     if not raw or "/" in raw or " " in raw:
         return None
+    # IP addresses belong to `ip_cidr` route rules. Treating them as domain
+    # suffixes silently makes an entry such as `213.136.80.131` ineffective.
+    try:
+        ipaddress.ip_address(raw)
+    except ValueError:
+        pass
+    else:
+        return None
+    if ":" in raw:
+        return None
     return raw
 
 
@@ -99,6 +111,48 @@ def parse_domains_text(text: str) -> list[str]:
         seen.add(candidate)
         out.append(candidate)
     return out
+
+
+def normalize_ip_cidr(value: str) -> str | None:
+    """Normalize an IPv4/IPv6 address or CIDR to a canonical network string."""
+    raw = value.strip()
+    if not raw:
+        return None
+    if "://" in raw:
+        parsed = urlparse(raw)
+        raw = parsed.hostname or ""
+    elif raw.startswith("["):
+        parsed = urlparse(f"//{raw}")
+        raw = parsed.hostname or ""
+    try:
+        address = ipaddress.ip_address(raw)
+    except ValueError:
+        try:
+            network = ipaddress.ip_network(raw, strict=False)
+        except ValueError:
+            return None
+        return str(network)
+    return f"{address}/32" if address.version == 4 else f"{address}/128"
+
+
+def parse_route_targets(text: str) -> tuple[list[str], list[str]]:
+    """Parse the routing editor into domain names and IP/CIDR targets."""
+    domains: list[str] = []
+    ip_cidrs: list[str] = []
+    seen_domains: set[str] = set()
+    seen_ips: set[str] = set()
+    for line in text.splitlines():
+        candidate_ip = normalize_ip_cidr(line)
+        if candidate_ip:
+            if candidate_ip not in seen_ips:
+                seen_ips.add(candidate_ip)
+                ip_cidrs.append(candidate_ip)
+            continue
+        candidate_domain = normalize_domain(line)
+        if candidate_domain and candidate_domain not in seen_domains:
+            seen_domains.add(candidate_domain)
+            domains.append(candidate_domain)
+    return domains, ip_cidrs
 
 
 def _build_transport_from_link(
@@ -803,10 +857,55 @@ def load_profiles_from_text(content: str) -> list[Profile]:
 def _direct_dns_server() -> dict[str, Any]:
     return {
         "tag": "direct-dns",
-        "type": "udp",
-        "server": "1.1.1.1",
-        "server_port": 53,
+        # Use the host resolver for direct DNS. Hard-coding public UDP/53
+        # resolvers breaks on networks that block or rewrite those servers.
+        "type": "local",
     }
+
+
+def _parse_dns_target(value: str) -> tuple[str, str, int]:
+    """Parse a custom DNS target without losing bare IPv6 addresses."""
+    raw = value.strip()
+    if not raw:
+        raise ConfigError("custom dns is empty")
+
+    if "://" in raw:
+        scheme, target = raw.split("://", 1)
+        scheme = scheme.lower()
+        try:
+            host = str(ipaddress.ip_address(target))
+            parsed = None
+        except ValueError:
+            parsed = urlparse(raw)
+            host = parsed.hostname
+    else:
+        try:
+            host = str(ipaddress.ip_address(raw))
+            return "udp", host, 53
+        except ValueError:
+            parsed = urlparse(f"//{raw}")
+            scheme = "udp"
+            host = parsed.hostname
+
+    if scheme not in {"udp", "tcp"}:
+        raise ConfigError("custom dns supports only udp/tcp")
+    if not host:
+        raise ConfigError("custom dns address is invalid")
+    if parsed is not None and (
+        parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+    ):
+        raise ConfigError("custom dns address is invalid")
+    try:
+        port = parsed.port if parsed is not None and parsed.port is not None else 53
+    except ValueError as exc:
+        raise ConfigError("custom dns port is invalid") from exc
+    if not 1 <= port <= 65535:
+        raise ConfigError("custom dns port is invalid")
+    return scheme, host, port
 
 
 def convert_bundle_outbound(ob: dict[str, Any]) -> dict[str, Any] | None:
@@ -821,13 +920,36 @@ def build_singbox_config(
     rule_set_available: Callable[[str, str], bool] | None = None,
     unavailable: set[str] | None = None,
 ) -> dict[str, Any]:
-    from app.xray_bundle import cached_rule_set_available, convert_xray_bundle, rule_set_path
+    from app.xray_bundle import (
+        bundle_proxy_outbounds,
+        cached_rule_set_available,
+        convert_xray_bundle,
+        rule_set_path,
+    )
 
     routing = routing or RoutingOptions()
     mode = routing.mode if routing.mode in {"all", "only_selected", "all_except_selected"} else "all"
     dns_mode = routing.dns_mode if routing.dns_mode in {"proxy", "direct", "custom"} else "proxy"
     custom_dns = routing.custom_dns.strip()
-    domains = [x for x in routing.domains if x]
+    domains: list[str] = []
+    ip_cidrs: list[str] = []
+    seen_domains: set[str] = set()
+    seen_ip_cidrs: set[str] = set()
+    # Reclassify legacy callers that put an IP into `domains` directly.
+    for raw_target in [*routing.domains, *routing.ip_cidrs]:
+        value = str(raw_target).strip()
+        if not value:
+            continue
+        ip_cidr = normalize_ip_cidr(value)
+        if ip_cidr:
+            if ip_cidr not in seen_ip_cidrs:
+                seen_ip_cidrs.add(ip_cidr)
+                ip_cidrs.append(ip_cidr)
+            continue
+        domain = normalize_domain(value)
+        if domain and domain not in seen_domains:
+            seen_domains.add(domain)
+            domains.append(domain)
     rule_key = "domain_suffix" if routing.include_subdomains else "domain"
     # Rule order matters in sing-box: place sniff and domain routing before broad fallback rules.
     rules: list[dict[str, Any]] = [{"action": "sniff"}]
@@ -862,24 +984,42 @@ def build_singbox_config(
     ]
     final_outbound = bundle_final
 
+    server_ips: set[str] = set()
+    server_domains: set[str] = set()
+
+    def _collect_server(addr: Any) -> None:
+        if not addr:
+            return
+        clean_addr = str(addr).strip().strip("[]")
+        if not clean_addr:
+            return
+        try:
+            ip = ipaddress.ip_address(clean_addr)
+            server_ips.add(f"{ip}/32" if ip.version == 4 else f"{ip}/128")
+        except ValueError:
+            domain = normalize_domain(clean_addr)
+            if domain:
+                server_domains.add(domain)
+
+    for ob in proxy_outbounds:
+        _collect_server(ob.get("server"))
+
+    if xray:
+        for _, ob in bundle_proxy_outbounds(xray, convert_bundle_outbound):
+            _collect_server(ob.get("server"))
+
     if dns_mode == "custom":
-        if not custom_dns:
-            raise ConfigError("custom dns is empty")
-        parsed_custom = urlparse(custom_dns if "://" in custom_dns else f"udp://{custom_dns}")
-        custom_type = (parsed_custom.scheme or "udp").lower()
-        custom_server = parsed_custom.hostname
-        custom_port = parsed_custom.port or 53
-        if custom_type not in {"udp", "tcp"}:
-            raise ConfigError("custom dns supports only udp/tcp")
-        if not custom_server:
-            raise ConfigError("custom dns address is invalid")
+        custom_type, custom_server, custom_port = _parse_dns_target(custom_dns)
         dns_config = {
             "servers": [
+                _direct_dns_server(),
                 {
                     "tag": "custom-dns",
                     "type": custom_type,
                     "server": custom_server,
                     "server_port": custom_port,
+                    # Needed when the custom server is entered as a hostname.
+                    "domain_resolver": "direct-dns",
                 }
             ],
             "final": "custom-dns",
@@ -891,15 +1031,10 @@ def build_singbox_config(
             "servers": [
                 {
                     "tag": "proxy-dns",
-                    "type": "udp",
-                    "server": "1.1.1.1",
-                    "server_port": 53,
-                    "detour": proxy_tag,
-                },
-                {
-                    "tag": "proxy-dns-fallback",
+                    # TCP DNS works with TCP-only outbounds (HTTP/TCP links)
+                    # as well as UDP-capable proxy protocols.
                     "type": "tcp",
-                    "server": "8.8.8.8",
+                    "server": "1.1.1.1",
                     "server_port": 53,
                     "detour": proxy_tag,
                 },
@@ -913,12 +1048,6 @@ def build_singbox_config(
         dns_config = {
             "servers": [
                 _direct_dns_server(),
-                {
-                    "tag": "direct-dns-fallback",
-                    "type": "udp",
-                    "server": "8.8.8.8",
-                    "server_port": 53,
-                },
             ],
             "final": "direct-dns",
         }
@@ -932,6 +1061,10 @@ def build_singbox_config(
             {"ip_cidr": ["127.0.0.0/8", "::1/128"], "outbound": "direct"},
         ]
     )
+    if server_domains:
+        rules.append({"domain": sorted(server_domains), "outbound": "direct"})
+    if server_ips:
+        rules.append({"ip_cidr": sorted(server_ips), "outbound": "direct"})
 
     if routing.ignore_ru_domains:
         rules.append({"domain_suffix": [RU_DOMAIN_SUFFIX], "outbound": "direct"})
@@ -943,17 +1076,22 @@ def build_singbox_config(
     udp_ok = bundle is not None or _supports_udp(proxy_outbounds[0])
     if mode == "only_selected":
         final_outbound = "direct"
-        if domains:
+        targets = ((rule_key, domains), ("ip_cidr", ip_cidrs))
+        for target_key, target_values in targets:
+            if not target_values:
+                continue
             if udp_ok:
-                rules.append({rule_key: domains, "outbound": proxy_tag})
+                rules.append({target_key: target_values, "outbound": proxy_tag})
             else:
                 # TCP-only proxies cannot carry UDP. Keep non-selected traffic direct and
                 # explicitly reject selected-domain UDP to avoid ambiguous fallback behavior.
-                rules.append({rule_key: domains, "network": ["udp"], "outbound": "block"})
-                rules.append({rule_key: domains, "outbound": proxy_tag})
+                rules.append({target_key: target_values, "network": ["udp"], "outbound": "block"})
+                rules.append({target_key: target_values, "outbound": proxy_tag})
     elif mode == "all_except_selected":
         if domains:
             rules.append({rule_key: domains, "outbound": "direct"})
+        if ip_cidrs:
+            rules.append({"ip_cidr": ip_cidrs, "outbound": "direct"})
 
     if bundle is not None and mode != "only_selected":
         # The provider's own routing (per-service nodes, balancers, direct lists) comes after the
