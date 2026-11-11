@@ -270,10 +270,13 @@ class SubscriptionsPanel(QWidget):
         root.addWidget(self.feedback)
 
         self.scroll = QScrollArea()
+        self.scroll.setObjectName('subscriptionScroll')
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.NoFrame)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         host = QWidget()
+        host.setObjectName('subscriptionHost')
+        host.setAttribute(Qt.WA_StyledBackground, True)
         self.cards_layout = QVBoxLayout(host)
         self.cards_layout.setContentsMargins(0, 2, 0, 2)
         self.cards_layout.setSpacing(9)
@@ -284,6 +287,7 @@ class SubscriptionsPanel(QWidget):
         self.cards_layout.addWidget(self.empty)
         self.cards_layout.addStretch(1)
         self.scroll.setWidget(host)
+        self.card_host = host
         root.addWidget(self.scroll, 1)
         foot = QHBoxLayout()
         self.counter = QLabel("0 подписок")

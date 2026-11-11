@@ -45,9 +45,14 @@ def ui(app, monkeypatch, tmp_path):
 
 
 def test_main_navigation_has_single_compact_footer(ui, app):
-    assert ui.width() == 540
+    assert ui.width() == 510
     assert len(ui.nav_buttons) == 3
     assert ui.bottom_nav.isVisible()
+    assert ui.bottom_nav.height() == 44
+    assert all(button.height() == 34 for button in [*ui.nav_buttons, ui.more_btn])
+    assert all(not button.icon().isNull() for button in [*ui.nav_buttons, ui.more_btn])
+    assert ui.header_menu_btn.isVisible()
+    assert ui.header_menu_btn.menu() is not None
     assert ui.app_quick_btn.isVisible()
     ui._set_bottom_page(3)
     app.processEvents()
@@ -100,3 +105,51 @@ def test_global_ru_bypass_is_visible_persistent_and_survives_presets(ui, app):
     ui._set_bottom_page(3)
     ui.application_list.item(0).setCheckState(Qt.Checked)
     assert ui._routing_options().ignore_ru_domains
+
+
+@pytest.mark.parametrize('width,height', [(380, 550), (400, 595), (520, 690), (720, 780)])
+def test_compact_footer_never_clips_and_preserves_navigation(ui, app, width, height):
+    ui.resize(width, height)
+    ui.show()
+    for page in (0, 1, 6, 3, 2, 5, 4):
+        ui._set_bottom_page(page)
+        app.processEvents()
+        rect = ui.bottom_nav.geometry()
+        assert rect.right() <= ui.centralWidget().width()
+        assert rect.bottom() <= ui.centralWidget().height()
+        assert ui.bottom_nav.height() == 44
+        for button in [*ui.nav_buttons, ui.more_btn]:
+            assert button.height() == 34
+            assert button.geometry().right() < ui.bottom_nav.width()
+        assert ui.more_btn.isChecked() == (page not in (0, 1, 6))
+
+
+def test_empty_scroll_areas_use_dark_theme_and_no_horizontal_bar(ui, app):
+    ui.resize(380, 550)
+    ui._set_bottom_page(0)
+    app.processEvents()
+    assert not ui.overview_scroll.horizontalScrollBar().isVisible()
+    assert ui.vpn_status_card.height() < 85
+    ui._set_bottom_page(6)
+    app.processEvents()
+    host = ui.subscriptions_panel.card_host
+    image = host.grab().toImage()
+    assert image.pixelColor(host.width() // 2, max(1, host.height() - 20)).lightness() < 70
+
+
+def test_app_explanation_is_collapsed_until_requested(ui, app):
+    ui._set_bottom_page(3)
+    app.processEvents()
+    assert not ui.app_warning.isVisible()
+    ui.app_help_btn.click()
+    app.processEvents()
+    assert ui.app_warning.isVisible()
+
+
+def test_dashboard_keeps_dark_background_in_tall_window(ui, app):
+    ui.resize(520, 690)
+    ui._set_bottom_page(0)
+    app.processEvents()
+    body = ui.overview_scroll.widget()
+    image = body.grab().toImage()
+    assert image.pixelColor(body.width() // 2, max(1, body.height() - 18)).lightness() < 70
