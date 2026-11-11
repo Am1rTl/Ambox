@@ -55,7 +55,7 @@ def render(output: Path) -> None:
                 updated_at=0, user_info={'upload': 100000, 'download': 1240000000, 'total': 10000000000}
             ))
             window._refresh_profile_views()
-            window._refresh_quick_profiles()
+            window._sync_quick_profile_selector()
             window.subscriptions_panel.refresh_list()
             pages = {'vpn': 0, 'configs': 1, 'subscriptions': 6, 'apps': 3}
             for size in ((380, 550), (520, 690), (720, 780)):
