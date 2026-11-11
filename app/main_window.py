@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
 from app.app_paths import ensure_user_owned, import_configs_dir, log_path, profiles_path, settings_path
 from app.desktop_apps import DesktopApp, identity, installed_applications, merge_applications, running_applications
 from app.theme import STYLESHEET
+from app.nav_icons import navigation_icon
 from app.security import atomic_private_json, redact, redacted_structure
 from app.quality import QualityTracker, should_switch
 from app.profile_sources import profile_indices_for_source
@@ -160,8 +161,8 @@ class MainWindow(QMainWindow):
     def __init__(self, initial_link: str | None = None) -> None:
         super().__init__()
         self.setWindowTitle("ambox")
-        self.resize(540, 720)
-        self.setMinimumSize(400, 565)
+        self.resize(520, 690)
+        self.setMinimumSize(380, 550)
         self._app_icon = self._build_app_icon()
         self.setWindowIcon(self._app_icon)
 
@@ -279,22 +280,22 @@ class MainWindow(QMainWindow):
         root.setAcceptDrops(True)
 
         main = QVBoxLayout(root)
-        main.setContentsMargins(12, 8, 12, 10)
+        main.setContentsMargins(10, 6, 10, 8)
         main.setSpacing(0)
 
         phone_shell = QFrame()
         phone_shell.setObjectName("phoneShell")
         phone_layout = QVBoxLayout(phone_shell)
         phone_layout.setContentsMargins(0, 0, 0, 0)
-        phone_layout.setSpacing(10)
+        phone_layout.setSpacing(7)
 
         header = QFrame()
         header.setObjectName("headerCard")
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(6, 8, 6, 12)
+        header_layout.setContentsMargins(4, 5, 4, 7)
         header_layout.setSpacing(8)
         logo = QLabel()
-        logo.setPixmap(self._app_icon.pixmap(QSize(28, 28)))
+        logo.setPixmap(self._app_icon.pixmap(QSize(25, 25)))
         header_layout.addWidget(logo)
         title = QLabel('ambox')
         title.setObjectName('panelTitle')
@@ -312,13 +313,13 @@ class MainWindow(QMainWindow):
 
         connect_tab = QWidget()
         connect_layout = QVBoxLayout(connect_tab)
-        connect_layout.setContentsMargins(4, 4, 4, 4)
-        connect_layout.setSpacing(10)
+        connect_layout.setContentsMargins(3, 3, 3, 3)
+        connect_layout.setSpacing(8)
 
         self.vpn_status_card = QFrame()
         self.vpn_status_card.setObjectName("statusCard")
         vpn_status_layout = QHBoxLayout(self.vpn_status_card)
-        vpn_status_layout.setContentsMargins(12, 10, 12, 10)
+        vpn_status_layout.setContentsMargins(12, 9, 12, 9)
         vpn_status_layout.setSpacing(8)
 
         self.status_dot = QLabel("●")
@@ -342,7 +343,7 @@ class MainWindow(QMainWindow):
 
         self.connect_btn = QPushButton("Подключить")
         self.connect_btn.setObjectName("connectBtn")
-        self.connect_btn.setMinimumHeight(48)
+        self.connect_btn.setFixedHeight(44)
         self.connect_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.connect_btn.setProperty("vpnState", "disconnected")
         self.connect_btn.clicked.connect(self.toggle_connection)
@@ -432,8 +433,9 @@ class MainWindow(QMainWindow):
         self.quick_profile_frame.setVisible(False)
         connect_layout.addWidget(self.quick_profile_frame)
 
-        self.app_quick_btn = QPushButton('Приложения  ·  Весь трафик')
+        self.app_quick_btn = QPushButton('Через VPN: все приложения')
         self.app_quick_btn.setObjectName('quickLink')
+        self.app_quick_btn.setFixedHeight(35)
         self.app_quick_btn.setToolTip('Выбрать, какие приложения использовать через VPN')
         self.app_quick_btn.clicked.connect(lambda: self._set_bottom_page(3))
         connect_layout.addWidget(self.app_quick_btn)
@@ -441,8 +443,8 @@ class MainWindow(QMainWindow):
         self.traffic_card = QFrame()
         self.traffic_card.setObjectName('metricCard')
         traffic_layout = QVBoxLayout(self.traffic_card)
-        traffic_layout.setContentsMargins(12, 11, 12, 10)
-        traffic_layout.setSpacing(6)
+        traffic_layout.setContentsMargins(12, 9, 12, 9)
+        traffic_layout.setSpacing(5)
         traffic_header = QHBoxLayout()
         traffic_title = QLabel('ТРАФИК В РЕАЛЬНОМ ВРЕМЕНИ')
         traffic_title.setObjectName('fieldLabel')
@@ -453,7 +455,7 @@ class MainWindow(QMainWindow):
         traffic_header.addWidget(self.traffic_label)
         traffic_layout.addLayout(traffic_header)
         self.traffic_chart = TrafficChart(self.traffic_card)
-        self.traffic_chart.setFixedHeight(102)
+        self.traffic_chart.setFixedHeight(76)
         traffic_layout.addWidget(self.traffic_chart)
         quality_row = QHBoxLayout()
         self.quality_status_label = QLabel('Ожидаем измерений')
@@ -933,31 +935,50 @@ class MainWindow(QMainWindow):
         self.subscriptions_panel = SubscriptionsPanel(self)
         self.content_stack.addWidget(self.subscriptions_panel)  # index 6
 
+        # One compact, fixed-size tab bar; no implicit global button padding.
         bottom_nav = QFrame()
-        bottom_nav.setObjectName("bottomNav")
+        bottom_nav.setObjectName('bottomNav')
+        bottom_nav.setFixedHeight(44)
         self.bottom_nav = bottom_nav
         nav_layout = QHBoxLayout(bottom_nav)
-        nav_layout.setContentsMargins(5, 5, 5, 5)
+        nav_layout.setContentsMargins(4, 4, 4, 4)
         nav_layout.setSpacing(3)
         self.nav_buttons: list[QPushButton] = []
         self._mobile_pages = [0, 1, 6]
-        for index, label in enumerate(["VPN", "Конфиги", "Подписки"]):
-            btn = QPushButton(label)
-            btn.setObjectName("navBtn")
-            btn.setCheckable(True)
-            btn.clicked.connect(lambda _checked=False, i=index: self._set_bottom_page(self._mobile_pages[i]))
-            nav_layout.addWidget(btn, 1)
-            self.nav_buttons.append(btn)
-        self.more_btn = QPushButton("Ещё")
-        self.more_btn.setObjectName("navBtn")
-        self.more_btn.setToolTip("Маршруты, приложения, диагностика и логи")
+        for index, (label, icon_name) in enumerate((
+            ('VPN', 'vpn'), ('Конфиги', 'configs'), ('Подписки', 'subscriptions'),
+        )):
+            button = QPushButton(label)
+            button.setObjectName('navBtn')
+            button.setIcon(navigation_icon(icon_name))
+            button.setIconSize(QSize(16, 16))
+            button.setFixedHeight(34)
+            button.setMinimumWidth(0)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            button.setCheckable(True)
+            button.setToolTip(label)
+            button.setAccessibleName(label)
+            button.clicked.connect(lambda _checked=False, i=index: self._set_bottom_page(self._mobile_pages[i]))
+            nav_layout.addWidget(button, 1)
+            self.nav_buttons.append(button)
+
+        self.more_btn = QPushButton('Ещё')
+        self.more_btn.setObjectName('navBtn')
+        self.more_btn.setIcon(navigation_icon('more'))
+        self.more_btn.setIconSize(QSize(16, 16))
+        self.more_btn.setFixedHeight(34)
+        self.more_btn.setMinimumWidth(0)
+        self.more_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.more_btn.setCheckable(True)
+        self.more_btn.setToolTip('Маршруты, приложения, диагностика и логи')
+        self.more_btn.setAccessibleName('Ещё: дополнительные разделы')
         more_menu = QMenu(self.more_btn)
-        for label, page in [("Маршрутизация", 2), ("Приложения", 3),
-                            ("Диагностика", 5), ("Логи", 4)]:
+        for label, page in [('Маршрутизация', 2), ('Приложения', 3),
+                            ('Диагностика', 5), ('Логи', 4)]:
             action = more_menu.addAction(label)
             action.triggered.connect(lambda _checked=False, i=page: self._set_bottom_page(i))
         self.more_btn.setMenu(more_menu)
-        nav_layout.addWidget(self.more_btn)
+        nav_layout.addWidget(self.more_btn, 1)
         phone_layout.addWidget(bottom_nav)
         self._set_bottom_page(0)
         main.addWidget(phone_shell, 1)
@@ -1161,9 +1182,7 @@ class MainWindow(QMainWindow):
         self.content_stack.setCurrentIndex(index)
         for page, button in zip(self._mobile_pages, self.nav_buttons):
             button.setChecked(page == index)
-        self.more_btn.setProperty("active", index not in self._mobile_pages)
-        self.more_btn.style().unpolish(self.more_btn)
-        self.more_btn.style().polish(self.more_btn)
+        self.more_btn.setChecked(index not in self._mobile_pages)
         if index == 6:
             self.subscriptions_panel.refresh_list()
 

@@ -45,9 +45,12 @@ def ui(app, monkeypatch, tmp_path):
 
 
 def test_main_navigation_has_single_compact_footer(ui, app):
-    assert ui.width() == 540
+    assert ui.width() == 520
     assert len(ui.nav_buttons) == 3
     assert ui.bottom_nav.isVisible()
+    assert ui.bottom_nav.height() == 44
+    assert all(button.height() == 34 for button in [*ui.nav_buttons, ui.more_btn])
+    assert all(not button.icon().isNull() for button in [*ui.nav_buttons, ui.more_btn])
     assert ui.app_quick_btn.isVisible()
     ui._set_bottom_page(3)
     app.processEvents()
@@ -100,3 +103,20 @@ def test_global_ru_bypass_is_visible_persistent_and_survives_presets(ui, app):
     ui._set_bottom_page(3)
     ui.application_list.item(0).setCheckState(Qt.Checked)
     assert ui._routing_options().ignore_ru_domains
+
+
+@pytest.mark.parametrize('width,height', [(380, 550), (400, 595), (520, 690), (720, 780)])
+def test_compact_footer_never_clips_and_preserves_navigation(ui, app, width, height):
+    ui.resize(width, height)
+    ui.show()
+    for page in (0, 1, 6, 3, 2, 5, 4):
+        ui._set_bottom_page(page)
+        app.processEvents()
+        rect = ui.bottom_nav.geometry()
+        assert rect.right() <= ui.centralWidget().width()
+        assert rect.bottom() <= ui.centralWidget().height()
+        assert ui.bottom_nav.height() == 44
+        for button in [*ui.nav_buttons, ui.more_btn]:
+            assert button.height() == 34
+            assert button.geometry().right() < ui.bottom_nav.width()
+        assert ui.more_btn.isChecked() == (page not in (0, 1, 6))
