@@ -76,9 +76,12 @@ def _configure_logging(debug: bool) -> None:
     handlers: list[logging.Handler] = []
     try:
         app_log_path = log_path()
-        handlers.append(
-            RotatingFileHandler(app_log_path, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8")
-        )
+        handler = RotatingFileHandler(app_log_path, maxBytes=10 * 1024 * 1024,
+                                      backupCount=3, encoding="utf-8")
+        # Rotate logs may contain endpoint details; never leave them world-readable.
+        if os.name == 'posix':
+            app_log_path.chmod(0o600)
+        handlers.append(handler)
     except OSError as exc:
         # Log dir/file may be unwritable (e.g. root-owned after a sudo run):
         # stay alive and log to stderr instead of crashing at startup.
@@ -181,6 +184,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Qt settings, crash logs, imported profiles and subscription credentials
+    # should be private even when a distro starts us with a permissive umask.
+    if os.name == 'posix':
+        os.umask(0o077)
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     if not args.foreground:
         _daemonize()

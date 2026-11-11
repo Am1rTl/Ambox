@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -18,6 +19,9 @@ from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QKeyS
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QDialog,
+    QDialogButtonBox,
+    QGridLayout,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -44,6 +48,11 @@ from PySide6.QtWidgets import (
 )
 
 from app.app_paths import ensure_user_owned, import_configs_dir, log_path, profiles_path, settings_path
+from app.security import atomic_private_json, redact, redacted_structure
+from app.quality import QualityTracker, should_switch
+from app.diagnostics import connected_diagnostics
+from app.route_presets import PRESETS, preset_values
+from app.dashboard import TrafficChart
 from app.config_parser import (
     ConfigError,
     Profile,
@@ -65,6 +74,7 @@ from app.subscriptions import (
     format_bytes,
     generate_subscription_id,
     is_likely_subscription_url,
+    subscription_due,
 )
 from app.subscriptions_dialog import SubscriptionsDialog
 from app.net_session import IFACE_NAME
@@ -157,12 +167,13 @@ class MainWindow(QMainWindow):
     # Worker threads must not touch widgets; they log through this queued signal.
     worker_log = Signal(str)
     resume_probe_finished = Signal(bool)
+    diagnostics_ready = Signal(object)
 
     def __init__(self, initial_link: str | None = None) -> None:
         super().__init__()
         self.setWindowTitle("ambox")
-        self.resize(460, 840)
-        self.setMinimumSize(360, 620)
+        self.resize(1040, 740)
+        self.setMinimumSize(360, 600)
         self._app_icon = self._build_app_icon()
         self.setWindowIcon(self._app_icon)
 
@@ -171,10 +182,12 @@ class MainWindow(QMainWindow):
         self.profile_usage_bytes: list[int] = []
         self._pending_latency_indices: set[int] = set()
         self._visible_profile_indices: list[int] = []
+        self._profile_row_items: dict[int, QListWidgetItem] = {}
         self.connected_index: int | None = None
         self._scan_in_progress = False
         self._pending_latency_refresh = False
         self._active_scan_id = 0
+        self._active_scan_profile_ids: list[str] = []
         self._latency_has_results = False
         self._last_latency_update_text = "never"
         self._last_auto_switch = 0.0
@@ -184,7 +197,31 @@ class MainWindow(QMainWindow):
         self._last_usage_persist = 0.0
         self._traffic_last_total: int | None = None
         self._last_used_store: dict[str, float] = {}
+        self._live_apply_timer = QTimer(self)
+        self._live_apply_timer.setSingleShot(True)
+        self._live_apply_timer.setInterval(650)
+        self._live_apply_timer.timeout.connect(self._apply_routing_changes_live)
         self._last_vpn_status = "disconnected"
+        self.quality = QualityTracker()
+        self.favorite_profile_ids: set[str] = set()
+        self._last_quality_persist = 0.0
+        self._last_switch_scan = -1
+        self._switch_candidate: str | None = None
+        self._switch_candidate_votes = 0
+        self._last_traffic_counters: tuple[int, int] | None = None
+        self._last_traffic_sample = time.monotonic()
+        self._desired_profile_id: str | None = None
+        self._reconnect_attempts = 0
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setSingleShot(True)
+        self._reconnect_timer.timeout.connect(self._attempt_reconnect)
+        self._subs_inflight: set[str] = set()
+        self._subs_silent: set[str] = set()
+        self._subscription_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='ambox-sub')
+        self._subscription_retry_at: dict[str, float] = {}
+        self._subscription_failures: dict[str, int] = {}
+        self._last_quota_notice: dict[str, float] = {}
+        self._diag_running = False
 
         self.subscription_store = SubscriptionStore()
         self._selected_location = "ALL"
@@ -195,7 +232,7 @@ class MainWindow(QMainWindow):
 
         self.vpn = VpnManager()
         self.settings = QSettings(str(settings_path()), QSettings.IniFormat)
-        ensure_user_owned(settings_path())
+        self._protect_settings_file()
 
         self._build_ui()
         self._build_menu()
@@ -214,19 +251,19 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._warn_if_not_running_as_sudo)
         startup_warning = self.vpn.take_startup_warning()
         if startup_warning:
-            self.logs.append(f"WARNING: {startup_warning}")
+            self._append_log(f'WARNING: {startup_warning}')
             logging.warning(startup_warning)
         for env_warning in self.vpn.environment_warnings():
-            self.logs.append(f"WARNING: {env_warning}")
+            self._append_log(f'WARNING: {env_warning}')
             logging.warning(env_warning)
 
         self.latency_timer = QTimer(self)
-        self.latency_timer.setInterval(10000)
+        self.latency_timer.setInterval(60000)
         self.latency_timer.timeout.connect(self.refresh_latencies)
         self.latency_timer.start()
 
         self.autoswitch_timer = QTimer(self)
-        self.autoswitch_timer.setInterval(5000)
+        self.autoswitch_timer.setInterval(20000)
         self.autoswitch_timer.timeout.connect(self._maybe_auto_switch)
         self.autoswitch_timer.start()
 
@@ -234,6 +271,11 @@ class MainWindow(QMainWindow):
         self.traffic_timer.setInterval(1000)
         self.traffic_timer.timeout.connect(self._on_traffic_tick)
         self.traffic_timer.start()
+
+        self.subscription_timer = QTimer(self)
+        self.subscription_timer.setInterval(30 * 60 * 1000)
+        self.subscription_timer.timeout.connect(self._auto_update_subscriptions_startup)
+        self.subscription_timer.start()
 
         if self.settings.value("auto_update_subs", True, type=bool):
             QTimer.singleShot(1500, self._auto_update_subscriptions_startup)
@@ -247,12 +289,46 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         root.setAcceptDrops(True)
 
-        main = QVBoxLayout(root)
-        main.setContentsMargins(0, 0, 0, 0)
+        main = QHBoxLayout(root)
+        main.setContentsMargins(14, 14, 14, 14)
+        main.setSpacing(14)
+
+        self.side_nav = QFrame()
+        self.side_nav.setObjectName('sideNav')
+        self.side_nav.setFixedWidth(195)
+        side_layout = QVBoxLayout(self.side_nav)
+        side_layout.setContentsMargins(12, 18, 12, 14)
+        side_layout.setSpacing(7)
+        brand = QLabel('◈  AMBOX')
+        brand.setObjectName('sideBrand')
+        side_layout.addWidget(brand)
+        side_hint = QLabel('Private network workspace')
+        side_hint.setObjectName('softHint')
+        side_hint.setWordWrap(True)
+        side_layout.addWidget(side_hint)
+        side_layout.addSpacing(20)
+        self.side_nav_buttons: dict[int, QPushButton] = {}
+        for label, page in [('⌂  Overview', 0), ('▤  Servers', 1),
+                            ('◇  Routing', 2), ('▦  Applications', 3),
+                            ('◉  Diagnostics', 5), ('≡  Logs', 4)]:
+            button = QPushButton(label)
+            button.setObjectName('sideNavBtn')
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(lambda _checked=False, i=page: self._set_bottom_page(i))
+            button.setMinimumHeight(43)
+            side_layout.addWidget(button)
+            self.side_nav_buttons[page] = button
+        side_layout.addStretch(1)
+        side_info = QLabel('Powered by sing-box\nLocal-first • Open configuration')
+        side_info.setObjectName('softHint')
+        side_info.setWordWrap(True)
+        side_layout.addWidget(side_info)
+        main.addWidget(self.side_nav)
 
         phone_shell = QFrame()
         phone_shell.setObjectName("phoneShell")
-        phone_shell.setMaximumWidth(640)
+        phone_shell.setMaximumWidth(1280)
         phone_layout = QVBoxLayout(phone_shell)
         phone_layout.setContentsMargins(10, 10, 10, 10)
         phone_layout.setSpacing(10)
@@ -263,13 +339,14 @@ class MainWindow(QMainWindow):
         header_layout.setContentsMargins(12, 10, 12, 10)
         header_layout.setSpacing(6)
 
-        title = QLabel("ambox")
-        title.setObjectName("panelTitle")
-        header_layout.addWidget(title, 0, Qt.AlignHCenter)
+        title = QLabel('ambox  /  network control')
+        title.setObjectName('panelTitle')
+        header_layout.addWidget(title, 0, Qt.AlignLeft)
 
-        subtitle = QLabel("VPN client without trash")
-        subtitle.setObjectName("subtitle")
-        header_layout.addWidget(subtitle, 0, Qt.AlignHCenter)
+        subtitle = QLabel('Reliable connection • clear diagnostics • private by design')
+        subtitle.setObjectName('subtitle')
+        subtitle.setWordWrap(True)
+        header_layout.addWidget(subtitle, 0, Qt.AlignLeft)
 
         phone_layout.addWidget(header)
 
@@ -380,14 +457,44 @@ class MainWindow(QMainWindow):
         self.quick_profile_latency_label.setObjectName("softHint")
         quick_profile_layout.addWidget(self.quick_profile_latency_label)
 
-        self.fastest_btn = QPushButton("⚡ Connect fastest")
-        self.fastest_btn.setToolTip("Connect to the lowest-latency profile (Ctrl+F)")
+        self.fastest_btn = QPushButton("⚡ Connect best")
+        self.fastest_btn.setToolTip("Connect to the highest-quality available profile (Ctrl+F)")
         self.fastest_btn.clicked.connect(self._connect_fastest)
         quick_profile_layout.addWidget(self.fastest_btn)
 
         self.quick_profile_frame.setVisible(False)
         connect_layout.addWidget(self.quick_profile_frame)
-        self.content_stack.addWidget(connect_tab)
+
+        self.traffic_card = QFrame()
+        self.traffic_card.setObjectName('metricCard')
+        traffic_layout = QVBoxLayout(self.traffic_card)
+        traffic_layout.setContentsMargins(12, 10, 12, 10)
+        traffic_layout.setSpacing(7)
+        traffic_header = QHBoxLayout()
+        traffic_title = QLabel('LIVE TRAFFIC')
+        traffic_title.setObjectName('fieldLabel')
+        traffic_header.addWidget(traffic_title)
+        traffic_header.addStretch(1)
+        self.traffic_label = QLabel('↓ 0 B/s     ↑ 0 B/s')
+        self.traffic_label.setObjectName('trafficRate')
+        traffic_header.addWidget(self.traffic_label)
+        traffic_layout.addLayout(traffic_header)
+        self.traffic_chart = TrafficChart(self.traffic_card)
+        traffic_layout.addWidget(self.traffic_chart)
+        quality_row = QHBoxLayout()
+        self.quality_status_label = QLabel('Quality: awaiting measurements')
+        self.quality_status_label.setObjectName('softHint')
+        quality_row.addWidget(self.quality_status_label, 1)
+        health_btn = QPushButton('Run diagnostics')
+        health_btn.clicked.connect(lambda: (self._set_bottom_page(5), self.run_diagnostics()))
+        quality_row.addWidget(health_btn)
+        traffic_layout.addLayout(quality_row)
+        connect_layout.addWidget(self.traffic_card)
+        overview_scroll = QScrollArea()
+        overview_scroll.setWidgetResizable(True)
+        overview_scroll.setFrameShape(QFrame.NoFrame)
+        overview_scroll.setWidget(connect_tab)
+        self.content_stack.addWidget(overview_scroll)
 
         profiles_tab = QWidget()
         profiles_layout = QVBoxLayout(profiles_tab)
@@ -416,6 +523,8 @@ class MainWindow(QMainWindow):
         self.profile_sort_combo.addItem("Latency", "latency")
         self.profile_sort_combo.addItem("Location", "location")
         self.profile_sort_combo.addItem("Recently used", "recent")
+        self.profile_sort_combo.addItem('Favorites first', 'favorites')
+        self.profile_sort_combo.addItem('Smart quality', 'quality')
         profile_tools.addWidget(self.profile_sort_combo)
         profiles_layout.addLayout(profile_tools)
 
@@ -478,7 +587,7 @@ class MainWindow(QMainWindow):
         self.profile_list.setContextMenuPolicy(Qt.CustomContextMenu)
         profiles_layout.addWidget(self.profile_list, 1)
 
-        self.profile_list_hint = QLabel("Right click for actions. Drag to reorder in manual mode. Double click to connect. Drop files here to import.")
+        self.profile_list_hint = QLabel("Double-click to connect · drop files here to import")
         self.profile_list_hint.setObjectName("softHint")
         self.profile_list_hint.setWordWrap(True)
         profiles_layout.addWidget(self.profile_list_hint)
@@ -513,12 +622,13 @@ class MainWindow(QMainWindow):
         settings_scroll.setAlignment(Qt.AlignTop)
 
         settings_body = QWidget()
+        settings_body.setObjectName("settingsBody")
         settings_layout = QVBoxLayout(settings_body)
         settings_layout.setContentsMargins(10, 10, 10, 10)
         settings_layout.setSpacing(10)
         settings_layout.setAlignment(Qt.AlignTop)
 
-        settings_title = QLabel("Routing and DNS")
+        settings_title = QLabel("Routing")
         settings_title.setObjectName("sectionTitle")
         settings_layout.addWidget(settings_title)
 
@@ -528,20 +638,34 @@ class MainWindow(QMainWindow):
         perf_layout.setContentsMargins(10, 10, 10, 10)
         perf_layout.setSpacing(8)
 
-        perf_label = QLabel("Performance")
+        perf_label = QLabel("Connection")
         perf_label.setObjectName("fieldLabel")
-        self.auto_switch_checkbox = QCheckBox("Auto switch to lowest latency")
-        self.auto_update_subs_checkbox = QCheckBox("Auto-update subscriptions on startup")
+        self.auto_switch_checkbox = QCheckBox("Smart Connect (quality + availability)")
+        self.auto_update_subs_checkbox = QCheckBox("Update subscriptions on startup")
         self.auto_update_subs_checkbox.setChecked(True)
+        self.auto_reconnect_checkbox = QCheckBox('Reconnect automatically after unexpected disconnect')
+        self.auto_reconnect_checkbox.setChecked(True)
         perf_layout.addWidget(perf_label)
         perf_layout.addWidget(self.auto_switch_checkbox)
+        perf_layout.addWidget(self.auto_reconnect_checkbox)
         perf_layout.addWidget(self.auto_update_subs_checkbox)
+
+        update_interval = QHBoxLayout()
+        interval_label = QLabel('Auto-update subscriptions every')
+        interval_label.setObjectName('softHint')
+        update_interval.addWidget(interval_label)
+        self.sub_update_hours_spin = QSpinBox()
+        self.sub_update_hours_spin.setRange(1, 168)
+        self.sub_update_hours_spin.setValue(12)
+        self.sub_update_hours_spin.setSuffix(' h')
+        update_interval.addWidget(self.sub_update_hours_spin)
+        perf_layout.addLayout(update_interval)
 
         timeout_host = QWidget()
         timeout_row = QHBoxLayout(timeout_host)
         timeout_row.setContentsMargins(0, 0, 0, 0)
         timeout_row.setSpacing(8)
-        timeout_desc = QLabel("Probe timeout")
+        timeout_desc = QLabel("Latency timeout")
         timeout_desc.setObjectName("softHint")
         self.timeout_spin = QSpinBox()
         self.timeout_spin.setRange(200, 5000)
@@ -555,23 +679,38 @@ class MainWindow(QMainWindow):
         perf_layout.addWidget(timeout_host)
         settings_layout.addWidget(perf_card)
 
-        route_label = QLabel("Routing mode")
-        route_label.setObjectName("fieldLabel")
+        preset_label = QLabel('One-click routing presets')
+        preset_label.setObjectName('fieldLabel')
+        settings_layout.addWidget(preset_label)
+        preset_row = QHBoxLayout()
+        self.preset_combo = QComboBox()
+        for key, (label, _domains) in PRESETS.items():
+            self.preset_combo.addItem(label, key)
+        preset_row.addWidget(self.preset_combo, 1)
+        preset_btn = QPushButton('Apply preset')
+        preset_btn.clicked.connect(self._apply_route_preset)
+        preset_row.addWidget(preset_btn)
+        settings_layout.addLayout(preset_row)
+        self.advanced_checkbox = QCheckBox('Show advanced routing & DNS options')
+        settings_layout.addWidget(self.advanced_checkbox)
+
+        route_label = QLabel('Routing mode')
+        route_label.setObjectName('fieldLabel')
         self.route_mode_combo = QComboBox()
         self.route_mode_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.route_mode_combo.setMinimumContentsLength(16)
-        self.route_mode_combo.addItem("Proxy all traffic", "all")
-        self.route_mode_combo.addItem("Proxy only listed domains/IPs", "only_selected")
-        self.route_mode_combo.addItem("Proxy all except listed domains/IPs", "all_except_selected")
+        self.route_mode_combo.addItem("Proxy everything", "all")
+        self.route_mode_combo.addItem("Proxy selected domains/IPs", "only_selected")
+        self.route_mode_combo.addItem("Proxy everything except selected", "all_except_selected")
         settings_layout.addWidget(route_label)
         settings_layout.addWidget(self.route_mode_combo)
 
-        self.routing_mode_hint = QLabel("Domain and IP rules are ignored when 'Proxy all traffic' is selected.")
+        self.routing_mode_hint = QLabel("Add one domain or IP per line.")
         self.routing_mode_hint.setWordWrap(True)
         self.routing_mode_hint.setObjectName("softHint")
         settings_layout.addWidget(self.routing_mode_hint)
 
-        self.ignore_ru_domains_checkbox = QCheckBox("Ignore .ru domains")
+        self.ignore_ru_domains_checkbox = QCheckBox("Bypass .ru domains")
         settings_layout.addWidget(self.ignore_ru_domains_checkbox)
 
         self.routing_domains_frame = QFrame()
@@ -580,13 +719,13 @@ class MainWindow(QMainWindow):
         routing_layout.setContentsMargins(10, 10, 10, 10)
         routing_layout.setSpacing(8)
 
-        self.include_subdomains_checkbox = QCheckBox("Include subdomains in matches")
+        self.include_subdomains_checkbox = QCheckBox("Include subdomains")
         self.include_subdomains_checkbox.setChecked(True)
         routing_layout.addWidget(self.include_subdomains_checkbox)
 
         self.domains_edit = QPlainTextEdit()
         self.domains_edit.setObjectName("domains")
-        self.domains_edit.setPlaceholderText("chatgpt.com\nyoutube.com\n203.0.113.10 or 203.0.113.0/24")
+        self.domains_edit.setPlaceholderText("example.com\nyoutube.com\n203.0.113.0/24")
         self.domains_edit.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         self.domains_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.domains_edit.setMinimumHeight(96)
@@ -599,9 +738,9 @@ class MainWindow(QMainWindow):
         self.dns_mode_combo = QComboBox()
         self.dns_mode_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.dns_mode_combo.setMinimumContentsLength(16)
-        self.dns_mode_combo.addItem("Proxy DNS queries", "proxy")
-        self.dns_mode_combo.addItem("Do not proxy DNS (direct)", "direct")
-        self.dns_mode_combo.addItem("Custom DNS server", "custom")
+        self.dns_mode_combo.addItem("DNS through proxy", "proxy")
+        self.dns_mode_combo.addItem("DNS direct", "direct")
+        self.dns_mode_combo.addItem("Custom DNS", "custom")
         settings_layout.addWidget(dns_label)
         settings_layout.addWidget(self.dns_mode_combo)
 
@@ -611,7 +750,7 @@ class MainWindow(QMainWindow):
         custom_dns_layout.setContentsMargins(10, 10, 10, 10)
         custom_dns_layout.setSpacing(6)
 
-        custom_dns_label = QLabel("Custom DNS")
+        custom_dns_label = QLabel("DNS address")
         custom_dns_label.setObjectName("fieldLabel")
         self.custom_dns_edit = QLineEdit()
         self.custom_dns_edit.setObjectName("customDns")
@@ -619,20 +758,86 @@ class MainWindow(QMainWindow):
         custom_dns_layout.addWidget(custom_dns_label)
         custom_dns_layout.addWidget(self.custom_dns_edit)
 
-        self.custom_dns_hint = QLabel("Used only when 'Custom DNS server' is selected.")
+        self.custom_dns_hint = QLabel("IP or host, for example 1.1.1.1")
         self.custom_dns_hint.setObjectName("softHint")
         custom_dns_layout.addWidget(self.custom_dns_hint)
         settings_layout.addWidget(self.custom_dns_frame)
 
-        hint = QLabel("Settings moved here to keep a phone-like bottom navigation layout.")
-        hint.setWordWrap(True)
-        hint.setObjectName("hint")
-        settings_layout.addWidget(hint)
+        self.auto_redirect_checkbox = QCheckBox('Linux TUN auto_redirect (nftables)')
+        self.auto_redirect_checkbox.setToolTip('Improves Linux routing and DNS interception; needs nftables and net-admin permission.')
+        settings_layout.addWidget(self.auto_redirect_checkbox)
+        leak_hint = QLabel('Important: strict routing and auto_redirect are NOT a system-wide kill switch. '
+                           'Direct/bypass rules can still leave the VPN.')
+        leak_hint.setObjectName('softHint')
+        leak_hint.setWordWrap(True)
+        settings_layout.addWidget(leak_hint)
+        self._advanced_widgets = [route_label, self.route_mode_combo,
+                                  self.routing_mode_hint, self.ignore_ru_domains_checkbox,
+                                  self.routing_domains_frame, dns_label, self.dns_mode_combo,
+                                  self.custom_dns_frame, self.auto_redirect_checkbox, leak_hint]
         settings_layout.addStretch(1)
 
         settings_scroll.setWidget(settings_body)
         settings_tab_layout.addWidget(settings_scroll)
         self.content_stack.addWidget(settings_tab)
+
+        applications_tab = QWidget()
+        applications_layout = QVBoxLayout(applications_tab)
+        applications_layout.setContentsMargins(10, 10, 10, 10)
+        applications_layout.setSpacing(10)
+
+        applications_title = QLabel("Applications")
+        applications_title.setObjectName("sectionTitle")
+        applications_layout.addWidget(applications_title)
+
+        applications_hint = QLabel("App rules are applied before domain/IP rules. DNS uses the global DNS mode.")
+        applications_hint.setWordWrap(True)
+        applications_hint.setObjectName("softHint")
+        applications_layout.addWidget(applications_hint)
+
+        app_mode_label = QLabel("Mode")
+        app_mode_label.setObjectName("fieldLabel")
+        applications_layout.addWidget(app_mode_label)
+        self.app_mode_combo = QComboBox()
+        self.app_mode_combo.addItem("Off", "disabled")
+        self.app_mode_combo.addItem("Proxy selected apps", "proxy_selected")
+        self.app_mode_combo.addItem("Bypass selected apps", "direct_selected")
+        applications_layout.addWidget(self.app_mode_combo)
+
+        self.app_search_edit = QLineEdit()
+        self.app_search_edit.setPlaceholderText("Search applications")
+        self.app_search_edit.setClearButtonEnabled(True)
+        self.app_search_edit.textChanged.connect(self._filter_application_list)
+        applications_layout.addWidget(self.app_search_edit)
+
+        app_tools = QHBoxLayout()
+        app_tools.setSpacing(8)
+        self.refresh_apps_btn = QPushButton("Refresh")
+        self.refresh_apps_btn.setToolTip("Refresh the list of running applications")
+        self.refresh_apps_btn.clicked.connect(self._refresh_application_list)
+        app_tools.addWidget(self.refresh_apps_btn)
+        self.add_app_btn = QPushButton("Add executable")
+        self.add_app_btn.setToolTip("Add an application that is not currently running")
+        self.add_app_btn.clicked.connect(self._add_application_executable)
+        app_tools.addWidget(self.add_app_btn)
+        self.app_selection_label = QLabel("No applications selected")
+        self.app_selection_label.setObjectName("softHint")
+        app_tools.addWidget(self.app_selection_label, 1)
+        applications_layout.addLayout(app_tools)
+
+        self.application_list = QListWidget()
+        self.application_list.setObjectName("applications")
+        self.application_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.application_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.application_list.setWordWrap(True)
+        applications_layout.addWidget(self.application_list, 1)
+
+        applications_footer = QLabel("Select a running app or add its executable manually. The path is shown in the tooltip.")
+        applications_footer.setWordWrap(True)
+        applications_footer.setObjectName("softHint")
+        applications_layout.addWidget(applications_footer)
+        self._refresh_application_list()
+        self.content_stack.addWidget(applications_tab)
 
         logs_tab = QWidget()
         logs_layout = QVBoxLayout(logs_tab)
@@ -641,7 +846,13 @@ class MainWindow(QMainWindow):
 
         logs_title = QLabel("Connection logs")
         logs_title.setObjectName("sectionTitle")
-        logs_layout.addWidget(logs_title)
+        logs_title_row = QHBoxLayout()
+        logs_title_row.addWidget(logs_title)
+        logs_title_row.addStretch(1)
+        logs_back_btn = QPushButton("Back")
+        logs_back_btn.clicked.connect(lambda: self._set_bottom_page(0))
+        logs_title_row.addWidget(logs_back_btn)
+        logs_layout.addLayout(logs_title_row)
 
         log_buttons = QHBoxLayout()
         log_buttons.setSpacing(8)
@@ -653,31 +864,66 @@ class MainWindow(QMainWindow):
         log_buttons.addWidget(self.open_log_file_btn)
         logs_layout.addLayout(log_buttons)
 
-        self.logs = QTextEdit()
+        self.logs = QPlainTextEdit()
         self.logs.setReadOnly(True)
+        self.logs.setMaximumBlockCount(600)
         self.logs.setObjectName("logs")
         logs_layout.addWidget(self.logs, 1)
         self.content_stack.addWidget(logs_tab)
 
+        diagnostics_tab = QWidget()
+        diagnostics_layout = QVBoxLayout(diagnostics_tab)
+        diagnostics_layout.setContentsMargins(12, 12, 12, 12)
+        diagnostics_layout.setSpacing(12)
+        diagnostic_title = QLabel('Connection diagnostics')
+        diagnostic_title.setObjectName('sectionTitle')
+        diagnostics_layout.addWidget(diagnostic_title)
+        diagnostic_hint = QLabel('Checks run on demand only while a TUN exists. With split tunneling, '
+                                 'external probes may follow a direct route. This is not a leak test or kill switch.')
+        diagnostic_hint.setObjectName('softHint')
+        diagnostic_hint.setWordWrap(True)
+        diagnostics_layout.addWidget(diagnostic_hint)
+        self.diagnostic_summary = QLabel('Not checked yet')
+        self.diagnostic_summary.setObjectName('diagnosticSummary')
+        self.diagnostic_summary.setWordWrap(True)
+        diagnostics_layout.addWidget(self.diagnostic_summary)
+        diag_actions = QHBoxLayout()
+        self.diag_run_btn = QPushButton('Run diagnostics')
+        self.diag_run_btn.clicked.connect(self.run_diagnostics)
+        diag_actions.addWidget(self.diag_run_btn)
+        diag_export_btn = QPushButton('Copy safe report')
+        diag_export_btn.clicked.connect(self.copy_diagnostic_report)
+        diag_actions.addWidget(diag_export_btn)
+        diag_actions.addStretch(1)
+        diagnostics_layout.addLayout(diag_actions)
+        self.diag_details = QPlainTextEdit()
+        self.diag_details.setReadOnly(True)
+        self.diag_details.setObjectName('logs')
+        self.diag_details.setPlaceholderText('Status, tunnel, DNS, public IP, RTT and process memory will appear here.')
+        diagnostics_layout.addWidget(self.diag_details, 1)
+        self.content_stack.addWidget(diagnostics_tab)
+
         bottom_nav = QFrame()
-        bottom_nav.setObjectName("bottomNav")
+        bottom_nav.setObjectName('bottomNav')
+        self.bottom_nav = bottom_nav
         nav_layout = QHBoxLayout(bottom_nav)
         nav_layout.setContentsMargins(0, 0, 0, 0)
         nav_layout.setSpacing(8)
 
         self.nav_buttons: list[QPushButton] = []
-        for index, label in enumerate(["VPN", "Profiles", "Settings", "Logs"]):
+        self._mobile_pages = [0, 1, 2, 3, 5]
+        for index, label in enumerate(['VPN', 'Servers', 'Rules', 'Apps', 'Health']):
             btn = QPushButton(label)
             btn.setObjectName("navBtn")
             btn.setCheckable(True)
             btn.setToolTip(f"{label} (Ctrl+{index + 1})")
-            btn.clicked.connect(lambda _checked=False, i=index: self._set_bottom_page(i))
+            btn.clicked.connect(lambda _checked=False, i=index: self._set_bottom_page(self._mobile_pages[i]))
             nav_layout.addWidget(btn, 1)
             self.nav_buttons.append(btn)
 
         phone_layout.addWidget(bottom_nav)
         self._set_bottom_page(0)
-        main.addWidget(phone_shell, 1, Qt.AlignHCenter)
+        main.addWidget(phone_shell, 1)
 
         for index in range(4):
             shortcut = QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self)
@@ -687,7 +933,8 @@ class MainWindow(QMainWindow):
         fastest_shortcut.setContext(Qt.ApplicationShortcut)
         fastest_shortcut.activated.connect(self._connect_fastest)
 
-        self.statusBar().showMessage("Disconnected")
+        self.statusBar().showMessage('Disconnected')
+        QTimer.singleShot(0, self._apply_responsive_layout)
 
         self.setStyleSheet(
             """
@@ -837,6 +1084,33 @@ class MainWindow(QMainWindow):
               border: 1px solid #323a49;
               selection-background-color: #3a3027;
             }
+            QScrollArea {
+              background-color: #0f1119;
+              border: none;
+            }
+            QScrollArea#settingsScroll > QWidget#qt_scrollarea_viewport,
+            QScrollArea#settingsScroll QWidget#settingsBody {
+              background-color: #0f1119;
+            }
+            QListWidget#applications {
+              border: 1px solid #333948;
+              border-radius: 11px;
+              background-color: #101520;
+              outline: none;
+              color: #d6dbe4;
+            }
+            QListWidget#applications::item {
+              min-height: 28px;
+              padding: 5px 6px;
+              border-bottom: 1px solid #232938;
+            }
+            QListWidget#applications::item:hover {
+              background-color: #171e2b;
+            }
+            QListWidget#applications::indicator {
+              width: 17px;
+              height: 17px;
+            }
             QWidget:disabled {
               color: #757d8c;
             }
@@ -911,9 +1185,50 @@ class MainWindow(QMainWindow):
               border: 1px solid #b9834b;
               color: #f0b774;
             }
-            QScrollArea#settingsScroll {
-              border: none;
+            QFrame#sideNav {
+              background-color: #101b28;
+              border: 1px solid #293747;
+              border-radius: 17px;
+            }
+            QLabel#sideBrand { font-size: 20px; font-weight: 800; color: #eff9ff; }
+            QPushButton#sideNavBtn {
               background: transparent;
+              border: 1px solid transparent;
+              color: #aabac9;
+              text-align: left;
+              font-size: 13px;
+              padding: 11px 15px;
+            }
+            QPushButton#sideNavBtn:hover { background-color: #1c3042; }
+            QPushButton#sideNavBtn:checked {
+              background-color: #173f48;
+              border: 1px solid #317f84;
+              color: #9ef3dc;
+            }
+            QFrame#metricCard {
+              background-color: #111b27;
+              border: 1px solid #2b3b4b;
+              border-radius: 13px;
+            }
+            QLabel#trafficRate { color: #83e6c8; font-weight: 700; }
+            QLabel#diagnosticSummary {
+              color: #c8f5e3;
+              background-color: #16313b;
+              border: 1px solid #2a5b64;
+              border-radius: 11px;
+              padding: 15px;
+              font-weight: 600;
+            }
+            QFrame#phoneShell { background: #101722; border-radius: 17px; }
+            QMainWindow { background-color: #0b111a; }
+            QWidget#root { background: #0b111a; }
+            #connectBtn { border-color: #65d9bb; color: #f1fff9; }
+            #connectBtn:hover { border-color: #9cfad9; color: #9cfad9; }
+            #connectBtn[vpnState="connected"] { border-color: #5ed0ae; color: #7bf4c9; }
+            QPushButton#navBtn:checked {
+              background-color: #17414b;
+              border-color: #48b4ae;
+              color: #a0f5df;
             }
             """
         )
@@ -926,6 +1241,19 @@ class MainWindow(QMainWindow):
         self.tray_icon.setIcon(self._app_icon)
         self.tray_icon.setToolTip("ambox")
         self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_menu = QMenu(self)
+        self.tray_toggle_action = self.tray_menu.addAction('Connect')
+        self.tray_toggle_action.triggered.connect(self.toggle_connection)
+        self.tray_profiles_menu = self.tray_menu.addMenu('Switch server')
+        self.tray_menu.addSeparator()
+        diagnostics_action = self.tray_menu.addAction('Diagnostics')
+        diagnostics_action.triggered.connect(lambda: (self._bring_to_front(), self._set_bottom_page(5)))
+        show_action = self.tray_menu.addAction('Open ambox')
+        show_action.triggered.connect(self._bring_to_front)
+        exit_action = self.tray_menu.addAction('Quit')
+        exit_action.triggered.connect(self.close)
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self._update_tray_menu()
         self.tray_icon.show()
 
     def _build_app_icon(self) -> QIcon:
@@ -966,7 +1294,27 @@ class MainWindow(QMainWindow):
         self.setWindowState(self.windowState() & ~Qt.WindowMinimized | Qt.WindowActive)
 
     def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
-        self._bring_to_front()
+        if reason in {QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick}:
+            self._bring_to_front()
+
+    def _update_tray_menu(self) -> None:
+        if getattr(self, 'tray_icon', None) is None:
+            return
+        connected = self.vpn.status in {'connected', 'connecting', 'disconnecting'}
+        self.tray_toggle_action.setText('Disconnect' if connected else 'Connect')
+        self.tray_icon.setToolTip(f'ambox • {self.vpn.status}')
+        self.tray_profiles_menu.clear()
+        indices = sorted(range(len(self.profiles)),
+                         key=lambda i: (self.profiles[i].id not in self.favorite_profile_ids,
+                                        self.profiles[i].name.lower()))[:40]
+        for idx in indices:
+            profile = self.profiles[idx]
+            prefix = '★ ' if profile.id in self.favorite_profile_ids else ''
+            action = self.tray_profiles_menu.addAction(prefix + profile.name)
+            action.setCheckable(True)
+            action.setChecked(idx == self.connected_index and connected)
+            action.triggered.connect(lambda _checked=False, i=idx: self._connect_profile(i))
+        self.tray_profiles_menu.setEnabled(bool(indices))
 
     def _setup_instance_server(self) -> None:
         """Serve second-instance launches: show window / import their link."""
@@ -1072,7 +1420,19 @@ class MainWindow(QMainWindow):
             return
         self.content_stack.setCurrentIndex(index)
         for i, button in enumerate(self.nav_buttons):
-            button.setChecked(i == index)
+            button.setChecked(self._mobile_pages[i] == index)
+        for page, button in self.side_nav_buttons.items():
+            button.setChecked(page == index)
+
+    def _apply_responsive_layout(self) -> None:
+        desktop = self.width() >= 840
+        self.side_nav.setVisible(desktop)
+        self.bottom_nav.setVisible(not desktop)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if hasattr(self, 'side_nav') and hasattr(self, 'bottom_nav'):
+            self._apply_responsive_layout()
 
     def _profile_item_text(self, index: int) -> str:
         profile = self.profiles[index]
@@ -1082,20 +1442,50 @@ class MainWindow(QMainWindow):
         else:
             suffix = "timeout" if latency is None else f"{latency} ms"
         usage = self.profile_usage_bytes[index] if index < len(self.profile_usage_bytes) else 0
-        connected = "[Connected] " if self.connected_index == index and self.vpn.status in {"connected", "connecting"} else ""
+        connected = '● ' if self.connected_index == index and self.vpn.status in {'connected', 'connecting'} else ''
+        favorite = '★ ' if profile.id in self.favorite_profile_ids else ''
         srv = str(profile.outbound.get("server") or "")
         loc = detect_location(profile.name, srv)
         flag_prefix = f"{loc.flag} " if loc.flag and loc.flag not in profile.name else ""
-        return f"{connected}{flag_prefix}{profile.name}  [{suffix} | {self._format_bytes(usage)}]"
+        quality = self.quality.quality(profile.id)
+        q_text = f' · Q{quality.score:.0f}' if quality and quality.samples >= 3 else ''
+        return f'{connected}{favorite}{flag_prefix}{profile.name}  [{suffix}{q_text} | {self._format_bytes(usage)}]'
 
     def _profile_usage_key(self, profile: Profile) -> str:
+        return profile.id
+
+    def _legacy_profile_usage_key(self, profile: Profile) -> str:
+        """Read old settings once, then discard plaintext credential-bearing keys."""
         try:
-            return json.dumps(profile.outbound, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            return json.dumps(profile.outbound, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
         except (TypeError, ValueError):
             return profile.name
 
+    def _profile_signature(self, profile: Profile) -> str:
+        outbound = {k: v for k, v in profile.outbound.items() if k != 'tag'}
+        data = json.dumps(outbound, sort_keys=True, default=str, ensure_ascii=True)
+        return hashlib.sha256(data.encode('utf-8')).hexdigest()
+
     def _profile_last_used_key(self, profile: Profile) -> str:
-        return self._profile_usage_key(profile)
+        return profile.id
+
+    def _migrate_profile_metadata(self, loaded: list[Profile]) -> bool:
+        old_usage, old_last = self._usage_store, self._last_used_store
+        new_usage: dict[str, int] = {}
+        new_last: dict[str, float] = {}
+        for profile in loaded:
+            legacy_key = self._legacy_profile_usage_key(profile)
+            new_usage[profile.id] = max(0, int(old_usage.get(profile.id, old_usage.get(legacy_key, 0))))
+            timestamp = float(old_last.get(profile.id, old_last.get(legacy_key, 0.0)))
+            if timestamp > 0:
+                new_last[profile.id] = timestamp
+        dirty = new_usage != old_usage or new_last != old_last
+        self._usage_store, self._last_used_store = new_usage, new_last
+        if dirty:
+            self._usage_dirty = True
+            self._persist_usage_store(force=True)
+            self._persist_last_used_store()
+        return dirty
 
     def _format_bytes(self, value: int) -> str:
         units = ["B", "KB", "MB", "GB", "TB"]
@@ -1126,14 +1516,24 @@ class MainWindow(QMainWindow):
             return
         self.settings.setValue("profile_usage_bytes", json.dumps(self._usage_store, ensure_ascii=True))
         self.settings.sync()
-        ensure_user_owned(settings_path())
+        self._protect_settings_file()
         self._usage_dirty = False
         self._last_usage_persist = now
 
     def _persist_last_used_store(self) -> None:
         self.settings.setValue("profile_last_used", json.dumps(self._last_used_store, ensure_ascii=True))
         self.settings.sync()
-        ensure_user_owned(settings_path())
+        self._protect_settings_file()
+
+    def _protect_settings_file(self) -> None:
+        """Harden settings migrated from older versions (possibly 0644)."""
+        path = settings_path()
+        ensure_user_owned(path)
+        if os.name == 'posix' and path.exists():
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
 
     def _touch_profile_last_used(self, index: int) -> None:
         if index < 0 or index >= len(self.profiles):
@@ -1193,6 +1593,12 @@ class MainWindow(QMainWindow):
             )
         elif sort_mode == "recent":
             indices.sort(key=lambda idx: (-self._profile_last_used_timestamp(idx), self.profiles[idx].name.lower()))
+        elif sort_mode == 'favorites':
+            indices.sort(key=lambda idx: (self.profiles[idx].id not in self.favorite_profile_ids,
+                                          self.profiles[idx].name.lower()))
+        elif sort_mode == 'quality':
+            indices.sort(key=lambda idx: -(self.quality.quality(self.profiles[idx].id).score
+                                           if self.quality.quality(self.profiles[idx].id) else 0))
         return indices
 
     def _set_selected_profile_index(self, profile_index: int | None) -> None:
@@ -1328,11 +1734,16 @@ class MainWindow(QMainWindow):
                 tooltip.append(f"Subscription: {sub.name}")
         tooltip.append(f"Latency: {'timeout' if latency is None else f'{latency} ms'}")
         tooltip.append(f"Traffic: {self._format_bytes(self.profile_usage_bytes[profile_index])}")
+        quality = self.quality.quality(profile.id)
+        if quality:
+            tooltip.append(f'Quality: {quality.score:.0f}/100 | Availability: {quality.reliability:.0%} '
+                           f'| RTT jitter: {quality.jitter_ms if quality.jitter_ms is not None else "unknown"} ms')
         last_used = self._profile_last_used_timestamp(profile_index)
         if last_used > 0:
             tooltip.append(f"Last used: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_used))}")
         item.setToolTip("\n".join(tooltip))
         self.profile_list.addItem(item)
+        self._profile_row_items[profile_index] = item
 
     def _add_manual_section_header(self, count: int) -> None:
         header = QListWidgetItem(f"📁 Manual configs ({count})")
@@ -1366,6 +1777,7 @@ class MainWindow(QMainWindow):
         ordered = self._sorted_profile_indices()
         grouped = self._is_grouped_view()
         self.profile_list.blockSignals(True)
+        self._profile_row_items.clear()
         self.profile_list.clear()
         if grouped:
             self._visible_profile_indices = []
@@ -1406,6 +1818,37 @@ class MainWindow(QMainWindow):
             self.profiles_empty_label.setVisible(True)
         else:
             self.profiles_empty_label.setVisible(False)
+
+    def _refresh_profile_rows(self, index: int | None = None) -> None:
+        """Incremental update: O(1) for a tick of one active server."""
+        visible = list(self._profile_row_items) if index is None else [index]
+        for profile_index in visible:
+            item = self._profile_row_items.get(profile_index)
+            if item is None or not (0 <= profile_index < len(self.profiles)):
+                continue
+            label = self._profile_item_text(profile_index)
+            if item.text() != label:
+                item.setText(label)
+        if index is None:
+            self._sync_quick_profile_selector()
+        elif 0 <= index < self.quick_profile_combo.count() and index < len(self.profiles):
+            # The quick selector lists profiles in storage order, not display order.
+            label = self._profile_item_text(index)
+            if self.quick_profile_combo.itemText(index) != label:
+                self.quick_profile_combo.blockSignals(True)
+                self.quick_profile_combo.setItemText(index, label)
+                self.quick_profile_combo.blockSignals(False)
+        self._update_vpn_profile_label()
+
+    def _persist_quality_store(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_quality_persist < 60.0:
+            return
+        # Prune history when profiles are removed. Never serialize outbound secrets.
+        valid_ids = {p.id for p in self.profiles}
+        history = {key: values for key, values in self.quality.dump().items() if key in valid_ids}
+        self.settings.setValue('profile_quality', json.dumps(history, ensure_ascii=True))
+        self._last_quality_persist = now
 
     def _sync_quick_profile_selector(self) -> None:
         labels = [self._profile_item_text(idx) for idx in range(len(self.profiles))]
@@ -1519,6 +1962,7 @@ class MainWindow(QMainWindow):
         self.vpn_empty_frame.setVisible(not self.profiles)
         self._update_vpn_profile_label()
         self._update_status_bar()
+        self._update_tray_menu()
 
     def _on_profile_list_row_changed(self, row: int) -> None:
         if row < 0:
@@ -1566,6 +2010,16 @@ class MainWindow(QMainWindow):
         ping_action.triggered.connect(self.refresh_latencies)
         menu.addAction(ping_action)
 
+        diag_action = QAction('Run diagnostics', self)
+        diag_action.setShortcut(QKeySequence('Ctrl+6'))
+        diag_action.triggered.connect(lambda: (self._set_bottom_page(5), self.run_diagnostics()))
+        menu.addAction(diag_action)
+
+        logs_action = QAction("Open logs", self)
+        logs_action.setShortcut(QKeySequence("Ctrl+5"))
+        logs_action.triggered.connect(lambda: self._set_bottom_page(4))
+        menu.addAction(logs_action)
+
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.close)
         menu.addAction(quit_action)
@@ -1587,6 +2041,9 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self) -> None:
         self.vpn.status_changed.connect(self._on_vpn_status_changed)
+        self.vpn.profile_starting.connect(self._on_vpn_profile_starting)
+        self.vpn.connection_lost.connect(self._on_connection_lost)
+        self.diagnostics_ready.connect(self._on_diagnostics_ready)
         self.vpn.log_line.connect(self._append_log)
         self.vpn.error.connect(self._show_error)
         self.vpn.singbox_availability_changed.connect(self._on_singbox_availability_changed)
@@ -1615,23 +2072,29 @@ class MainWindow(QMainWindow):
         self.auto_update_subs_checkbox.toggled.connect(
             lambda checked: self.settings.setValue("auto_update_subs", checked)
         )
+        self.auto_reconnect_checkbox.toggled.connect(
+            lambda value: self.settings.setValue('auto_reconnect', value))
+        self.sub_update_hours_spin.valueChanged.connect(
+            lambda value: self.settings.setValue('sub_update_hours', value))
+        self.advanced_checkbox.toggled.connect(self._apply_advanced_mode)
+        self.auto_redirect_checkbox.toggled.connect(self._on_auto_redirect_changed)
         self.timeout_spin.valueChanged.connect(lambda value: self.settings.setValue("timeout_ms", value))
         self.route_mode_combo.currentIndexChanged.connect(self._on_route_mode_changed)
         self.dns_mode_combo.currentIndexChanged.connect(self._on_dns_mode_changed)
-        self.custom_dns_edit.textChanged.connect(lambda value: self.settings.setValue("route_custom_dns", value))
-        self.ignore_ru_domains_checkbox.toggled.connect(
-            lambda checked: self.settings.setValue("route_ignore_ru_domains", checked)
-        )
-        self.include_subdomains_checkbox.toggled.connect(
-            lambda checked: self.settings.setValue("route_include_subdomains", checked)
-        )
-        self.domains_edit.textChanged.connect(
-            lambda: self.settings.setValue("route_domains_text", self.domains_edit.toPlainText())
-        )
+        self.app_mode_combo.currentIndexChanged.connect(self._on_app_mode_changed)
+        self.application_list.itemChanged.connect(self._on_application_item_changed)
+        self.custom_dns_edit.textChanged.connect(self._on_custom_dns_changed)
+        self.ignore_ru_domains_checkbox.toggled.connect(self._on_ignore_ru_domains_changed)
+        self.include_subdomains_checkbox.toggled.connect(self._on_include_subdomains_changed)
+        self.domains_edit.textChanged.connect(self._on_domains_text_changed)
 
     def _restore_settings(self) -> None:
         auto_switch = self.settings.value("auto_switch", False, type=bool)
         auto_update_subs = self.settings.value("auto_update_subs", True, type=bool)
+        auto_reconnect = self.settings.value('auto_reconnect', True, type=bool)
+        advanced = self.settings.value('ui/advanced', False, type=bool)
+        auto_redirect = self.settings.value('route_auto_redirect', False, type=bool)
+        update_hours = self.settings.value('sub_update_hours', 12, type=int)
         timeout_ms = self.settings.value("timeout_ms", 1200, type=int)
         route_mode = self.settings.value("route_mode", "all", type=str) or "all"
         route_dns_mode = self.settings.value("route_dns_mode", "", type=str) or ""
@@ -1639,12 +2102,24 @@ class MainWindow(QMainWindow):
             legacy_proxy_dns = self.settings.value("route_proxy_dns", True, type=bool)
             route_dns_mode = "proxy" if legacy_proxy_dns else "direct"
         route_custom_dns = self.settings.value("route_custom_dns", "", type=str) or ""
+        app_mode = self.settings.value("route_app_mode", "disabled", type=str) or "disabled"
         include_subdomains = self.settings.value("route_include_subdomains", True, type=bool)
         ignore_ru_domains = self.settings.value("route_ignore_ru_domains", False, type=bool)
         route_domains_text = self.settings.value("route_domains_text", "", type=str) or ""
         usage_raw = self.settings.value("profile_usage_bytes", "{}", type=str) or "{}"
         last_used_raw = self.settings.value("profile_last_used", "{}", type=str) or "{}"
         expanded_raw = self.settings.value("ui/expanded_sub_ids", "[]", type=str) or "[]"
+        fav_raw = self.settings.value('ui/favorites', '[]', type=str) or '[]'
+        quality_raw = self.settings.value('profile_quality', '{}', type=str) or '{}'
+        try:
+            favorites = json.loads(fav_raw)
+            self.favorite_profile_ids = set(str(x) for x in favorites) if isinstance(favorites, list) else set()
+        except ValueError:
+            self.favorite_profile_ids = set()
+        try:
+            self.quality = QualityTracker(json.loads(quality_raw))
+        except (TypeError, ValueError):
+            self.quality = QualityTracker()
         try:
             parsed_expanded = json.loads(expanded_raw)
             self._expanded_sub_ids = (
@@ -1671,6 +2146,10 @@ class MainWindow(QMainWindow):
 
         self.auto_switch_checkbox.setChecked(auto_switch)
         self.auto_update_subs_checkbox.setChecked(auto_update_subs)
+        self.auto_reconnect_checkbox.setChecked(auto_reconnect)
+        self.sub_update_hours_spin.setValue(max(1, min(update_hours, 168)))
+        self.auto_redirect_checkbox.setChecked(auto_redirect)
+        self.advanced_checkbox.setChecked(advanced)
         self.timeout_spin.setValue(timeout_ms)
         route_index = self.route_mode_combo.findData(route_mode)
         if route_index < 0:
@@ -1681,11 +2160,17 @@ class MainWindow(QMainWindow):
             dns_mode_index = 0
         self.dns_mode_combo.setCurrentIndex(dns_mode_index)
         self.custom_dns_edit.setText(route_custom_dns)
+        app_mode_index = self.app_mode_combo.findData(app_mode)
+        if app_mode_index < 0:
+            app_mode_index = 0
+        self.app_mode_combo.setCurrentIndex(app_mode_index)
         self.include_subdomains_checkbox.setChecked(include_subdomains)
         self.ignore_ru_domains_checkbox.setChecked(ignore_ru_domains)
         self.domains_edit.setPlainText(route_domains_text)
         self._update_routing_controls()
         self._update_dns_controls()
+        self._update_application_controls()
+        self._apply_advanced_mode()
 
     def _restore_profiles(self) -> None:
         path = profiles_path()
@@ -1718,26 +2203,29 @@ class MainWindow(QMainWindow):
                     outbound=outbound,
                     subscription_id=item.get("subscription_id"),
                     xray=xray if isinstance(xray, dict) else None,
+                    **({'id': item['id']} if isinstance(item.get('id'), str)
+                        and re.fullmatch(r'[0-9a-fA-F]{32}', item['id']) else {}),
                 )
             )
 
         if loaded:
+            migrated = self._migrate_profile_metadata(loaded)
             self._apply_loaded_profiles(loaded, persist=False)
+            if migrated or any(not isinstance(x.get('id'), str) for x in raw_profiles if isinstance(x, dict)):
+                self._save_profiles()
             self._append_log(f"Loaded {len(loaded)} saved profile(s) from {path}")
 
     def _write_profiles_atomically(self, payload: dict) -> None:
         path = profiles_path()
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        backup_path = path.with_suffix(path.suffix + ".bak")
-        tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        ensure_user_owned(tmp_path)
+        backup_path = path.with_suffix(path.suffix + '.bak')
         if path.exists():
             try:
                 shutil.copy2(path, backup_path)
                 ensure_user_owned(backup_path)
+                backup_path.chmod(0o600)
             except OSError:
                 pass
-        tmp_path.replace(path)
+        atomic_private_json(path, payload)
         ensure_user_owned(path)
 
     def _save_profiles(self) -> None:
@@ -1745,6 +2233,7 @@ class MainWindow(QMainWindow):
             "profiles": [
                 {
                     "name": profile.name,
+                    "id": profile.id,
                     "outbound": profile.outbound,
                     "subscription_id": profile.subscription_id,
                     **({"xray": profile.xray} if profile.xray else {}),
@@ -1757,20 +2246,261 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             self._append_log(f"Failed to save profiles: {exc}")
 
+    def _apply_advanced_mode(self, _checked: bool | None = None) -> None:
+        advanced = self.advanced_checkbox.isChecked()
+        self.settings.setValue('ui/advanced', advanced)
+        for widget in self._advanced_widgets:
+            widget.setVisible(advanced)
+        if advanced:
+            self._update_routing_controls()
+            self._update_dns_controls()
+
+    def _apply_route_preset(self) -> None:
+        key = str(self.preset_combo.currentData() or 'all')
+        if self.domains_edit.toPlainText().strip() or self.route_mode_combo.currentData() != 'all':
+            answer = QMessageBox.question(self, 'Apply routing preset',
+                        'Replace the current domain/IP routing rules with this preset? '
+                        'Application rules and DNS settings will be preserved.',
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+        mode, ignore_ru, domains = preset_values(key)
+        self.route_mode_combo.setCurrentIndex(self.route_mode_combo.findData(mode))
+        self.ignore_ru_domains_checkbox.setChecked(ignore_ru)
+        self.domains_edit.setPlainText(domains)
+        self._append_log(f'Applied routing preset: {key}')
+
+    def _on_auto_redirect_changed(self, checked: bool) -> None:
+        if checked and not shutil.which('nft'):
+            self.auto_redirect_checkbox.blockSignals(True)
+            self.auto_redirect_checkbox.setChecked(False)
+            self.auto_redirect_checkbox.blockSignals(False)
+            self._append_log('auto_redirect requires the nftables utility; setting not applied')
+            checked = False
+        self.settings.setValue('route_auto_redirect', checked)
+        self._schedule_live_routing_apply()
+
     def _on_route_mode_changed(self, _index: int = -1) -> None:
         self.settings.setValue("route_mode", self.route_mode_combo.currentData())
         self._update_routing_controls()
+        self._apply_advanced_mode()
+        self._schedule_live_routing_apply()
 
     def _on_dns_mode_changed(self, _index: int = -1) -> None:
         self.settings.setValue("route_dns_mode", self.dns_mode_combo.currentData())
         self._update_dns_controls()
+        self._apply_advanced_mode()
+        self._schedule_live_routing_apply()
+
+    def _on_app_mode_changed(self, _index: int = -1) -> None:
+        self.settings.setValue("route_app_mode", self.app_mode_combo.currentData())
+        self._update_application_controls()
+        self._schedule_live_routing_apply()
+
+    def _on_custom_dns_changed(self, value: str) -> None:
+        self.settings.setValue("route_custom_dns", value)
+        self._schedule_live_routing_apply()
+
+    def _on_ignore_ru_domains_changed(self, checked: bool) -> None:
+        self.settings.setValue("route_ignore_ru_domains", checked)
+        self._schedule_live_routing_apply()
+
+    def _on_include_subdomains_changed(self, checked: bool) -> None:
+        self.settings.setValue("route_include_subdomains", checked)
+        self._schedule_live_routing_apply()
+
+    def _on_domains_text_changed(self) -> None:
+        self.settings.setValue("route_domains_text", self.domains_edit.toPlainText())
+        self._schedule_live_routing_apply()
+
+    def _schedule_live_routing_apply(self) -> None:
+        """Debounce route-setting changes and apply them to the active tunnel.
+
+        sing-box does not reload route/DNS rules from its JSON file while it is
+        running. Reconnecting the current profile is the safe way to apply a
+        complete, validated config without restarting the GUI.
+        """
+        if self.vpn.status not in {"connected", "connecting"}:
+            return
+        self._live_apply_timer.start()
+
+    def _apply_routing_changes_live(self) -> None:
+        if self.vpn.status not in {"connected", "connecting"}:
+            return
+        routing = self._routing_options()
+        if routing.dns_mode == "custom" and routing.custom_dns.strip():
+            try:
+                # Reject malformed in-progress edits before stopping a healthy
+                # tunnel. The live DNS probe still runs in VpnManager later.
+                self.vpn._parse_custom_dns_target(routing.custom_dns)
+            except ValueError as exc:
+                self._append_log(f"Routing change not applied yet: {exc}")
+                return
+        index = self.connected_index
+        if index is None or not (0 <= index < len(self.profiles)):
+            index = self._selected_profile_index()
+        if index is None or not (0 <= index < len(self.profiles)):
+            self._append_log("Routing changed, but there is no active profile to reconnect.")
+            return
+        self._append_log("Routing/DNS/application settings changed; applying to the active tunnel...")
+        self._connect_profile(index)
+
+    def _read_saved_application_rules(self) -> list[dict[str, str]]:
+        raw = self.settings.value("route_applications", "[]", type=str) or "[]"
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(parsed, list):
+            return []
+        result: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            path = str(item.get("path") or "").strip()
+            if not name and not path:
+                continue
+            key = (name, path)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append({"name": name, "path": path})
+        return result
+
+    def _discover_running_applications(self) -> list[dict[str, str]]:
+        """Return distinct executable identities visible through /proc.
+
+        Process rules are evaluated by sing-box against the executable that
+        owns a socket.  We keep both comm (process name) and /proc/<pid>/exe
+        so the UI can still work when an application is not running at connect
+        time and can distinguish two programs with the same short name.
+        """
+        if os.name != "posix":
+            return []
+        found: dict[tuple[str, str], dict[str, str]] = {}
+        try:
+            pids = os.listdir("/proc")
+        except OSError:
+            return []
+        for pid in pids:
+            if not pid.isdigit() or int(pid) == os.getpid():
+                continue
+            try:
+                name = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
+                path = os.readlink(f"/proc/{pid}/exe")
+            except (OSError, UnicodeError):
+                continue
+            if not name or not path or path.startswith("["):
+                continue
+            key = (name, path)
+            found[key] = {"name": name, "path": path}
+        return sorted(found.values(), key=lambda item: (item["name"].lower(), item["path"]))
+
+    def _refresh_application_list(self) -> None:
+        saved = self._read_saved_application_rules()
+        current = self._discover_running_applications()
+        merged: dict[tuple[str, str], dict[str, str]] = {}
+        for item in [*saved, *current]:
+            key = (item.get("name", ""), item.get("path", ""))
+            if key[0] or key[1]:
+                merged[key] = {"name": key[0], "path": key[1]}
+
+        saved_keys = {(item["name"], item["path"]) for item in saved}
+        self.application_list.blockSignals(True)
+        self.application_list.clear()
+        for item in sorted(merged.values(), key=lambda value: (value["name"].lower(), value["path"])):
+            key = (item["name"], item["path"])
+            running = key not in saved_keys or key in {(x["name"], x["path"]) for x in current}
+            label = item["name"] or Path(item["path"]).name or item["path"]
+            if not running:
+                label += "  (not running)"
+            widget_item = QListWidgetItem(label)
+            widget_item.setFlags(widget_item.flags() | Qt.ItemIsUserCheckable)
+            widget_item.setCheckState(Qt.Checked if key in saved_keys else Qt.Unchecked)
+            widget_item.setData(Qt.UserRole, item)
+            if item["path"]:
+                widget_item.setToolTip(item["path"])
+            self.application_list.addItem(widget_item)
+        self.application_list.blockSignals(False)
+        self._filter_application_list(self.app_search_edit.text())
+        self._update_application_selection_label()
+
+    def _filter_application_list(self, text: str = "") -> None:
+        query = text.strip().casefold()
+        for index in range(self.application_list.count()):
+            item = self.application_list.item(index)
+            data = item.data(Qt.UserRole)
+            name = str(data.get("name") or "") if isinstance(data, dict) else ""
+            path = str(data.get("path") or "") if isinstance(data, dict) else ""
+            item.setHidden(bool(query) and query not in f"{name} {path}".casefold())
+
+    def _add_application_executable(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Select application executable", "/usr/bin")
+        if not path:
+            return
+        executable = Path(path)
+        if not executable.is_file() or not os.access(path, os.X_OK):
+            self._show_error("Selected file is not an executable.")
+            return
+        try:
+            executable = executable.resolve()
+        except OSError:
+            pass
+        saved = self._read_saved_application_rules()
+        entry = {"name": executable.name, "path": str(executable)}
+        if entry not in saved:
+            saved.append(entry)
+            self.settings.setValue("route_applications", json.dumps(saved, ensure_ascii=False))
+        self._refresh_application_list()
+        for index in range(self.application_list.count()):
+            item = self.application_list.item(index)
+            if item.data(Qt.UserRole) == entry:
+                item.setCheckState(Qt.Checked)
+                break
+
+    def _selected_application_rules(self) -> list[dict[str, str]]:
+        selected: list[dict[str, str]] = []
+        for index in range(self.application_list.count()):
+            item = self.application_list.item(index)
+            if item.checkState() != Qt.Checked:
+                continue
+            data = item.data(Qt.UserRole)
+            if isinstance(data, dict):
+                selected.append({"name": str(data.get("name") or ""), "path": str(data.get("path") or "")})
+        return selected
+
+    def _save_selected_application_rules(self) -> None:
+        self.settings.setValue("route_applications", json.dumps(self._selected_application_rules(), ensure_ascii=False))
+        self._update_application_selection_label()
+
+    def _on_application_item_changed(self, _item: QListWidgetItem) -> None:
+        self._save_selected_application_rules()
+        self._schedule_live_routing_apply()
+
+    def _update_application_selection_label(self) -> None:
+        count = len(self._selected_application_rules()) if hasattr(self, "application_list") else 0
+        self.app_selection_label.setText(f"{count} selected")
+
+    def _update_application_controls(self) -> None:
+        enabled = self.app_mode_combo.currentData() != "disabled"
+        self.application_list.setEnabled(enabled)
+        self.refresh_apps_btn.setEnabled(True)
+        self.add_app_btn.setEnabled(True)
+        if enabled:
+            self.app_selection_label.setToolTip(
+                "Selected application rules have priority over domain/IP rules."
+            )
+        else:
+            self.app_selection_label.setToolTip("Application routing is disabled.")
 
     def _update_routing_controls(self) -> None:
         needs_domains = self.route_mode_combo.currentData() in {"only_selected", "all_except_selected"}
         self.routing_domains_frame.setVisible(needs_domains)
         self.routing_mode_hint.setVisible(needs_domains)
         if needs_domains:
-            self.routing_mode_hint.setText("Routing uses the domain and IP/CIDR list below in this mode.")
+            self.routing_mode_hint.setText("One domain or IP/CIDR per line.")
         else:
             self.routing_mode_hint.setText("")
 
@@ -1778,9 +2508,9 @@ class MainWindow(QMainWindow):
         needs_custom_dns = self.dns_mode_combo.currentData() == "custom"
         self.custom_dns_frame.setVisible(needs_custom_dns)
         if needs_custom_dns:
-            self.custom_dns_hint.setText("Enter DNS server as IP/host, optional scheme (udp:// or tcp://).")
+            self.custom_dns_hint.setText("IP or host; udp:// and tcp:// are supported.")
         else:
-            self.custom_dns_hint.setText("Custom DNS is disabled in this mode.")
+            self.custom_dns_hint.setText("Select Custom DNS to enter an address.")
 
     def _on_singbox_availability_changed(self, available: bool) -> None:
         self.install_card.setVisible(not available)
@@ -1929,6 +2659,7 @@ class MainWindow(QMainWindow):
                 user_info=meta.get("headers_info", {}).get("user_info", {}) if isinstance(meta.get("headers_info"), dict) else {},
             )
             self.subscription_store.put(sub)
+            self._notify_quota(sub)
             self._apply_updated_subscription_profiles(sub_id, profiles)
         else:
             self._apply_loaded_profiles(profiles)
@@ -1940,12 +2671,14 @@ class MainWindow(QMainWindow):
         self._notify_user("Profiles imported", f"Imported {len(profiles)} profile(s)")
 
     def _auto_update_subscriptions_startup(self) -> None:
+        """Run only due, individually opted-in subscriptions; bounded workers."""
         if not self.auto_update_subs_checkbox.isChecked():
             return
-        subs = self.subscription_store.all()
-        if subs:
-            self._append_log(f"Auto-updating {len(subs)} subscription(s) on startup...")
-            self.update_all_subscriptions(silent=True)
+        now = time.time()
+        interval = self.sub_update_hours_spin.value()
+        for sub in self.subscription_store.all():
+            if subscription_due(sub, now, interval):
+                self._queue_subscription_update(sub, silent=True)
 
     def show_subscriptions_dialog(self) -> None:
         if self._subs_dialog is None:
@@ -1974,30 +2707,55 @@ class MainWindow(QMainWindow):
     def update_subscription(self, sub_id: str) -> None:
         sub = self.subscription_store.get(sub_id)
         if not sub:
-            self._show_error("Subscription not found")
+            self._show_error('Subscription not found')
             return
-        self._append_log(f"Updating subscription: {sub.name}")
-        worker = threading.Thread(
-            target=self._subscription_update_worker,
-            args=(sub.id, sub.original_link or sub.url, sub.name),
-            daemon=True,
-        )
-        worker.start()
+        self._queue_subscription_update(sub, silent=False, force=True)
 
     def update_all_subscriptions(self, silent: bool = False) -> None:
         subs = self.subscription_store.all()
         if not subs:
             if not silent:
-                self._notify_user("Subscriptions", "No subscriptions configured")
+                self._notify_user('Subscriptions', 'No subscriptions configured')
             return
-        self._append_log(f"Updating all {len(subs)} subscription(s)...")
-        for sub in subs:
-            worker = threading.Thread(
-                target=self._subscription_update_worker,
-                args=(sub.id, sub.original_link or sub.url, sub.name),
-                daemon=True,
-            )
-            worker.start()
+        if silent:
+            self._auto_update_subscriptions_startup()
+        else:
+            self._append_log(f'Updating {len(subs)} subscriptions (up to two at a time)...')
+            for sub in subs:
+                self._queue_subscription_update(sub, silent=False, force=True)
+
+    def _queue_subscription_update(self, sub: Subscription, *, silent: bool,
+                                   force: bool = False) -> None:
+        if sub.id in self._subs_inflight:
+            return
+        if not force and time.time() < self._subscription_retry_at.get(sub.id, 0):
+            return
+        self._subs_inflight.add(sub.id)
+        if silent:
+            self._subs_silent.add(sub.id)
+        self._subscription_pool.submit(self._subscription_update_worker,
+                                       sub.id, sub.original_link or sub.url, sub.name)
+
+    def _notify_quota(self, sub: Subscription) -> None:
+        stats = sub.traffic_stats()
+        if not stats.has_data:
+            return
+        now = time.time()
+        warnings = []
+        if stats.expire and 0 < stats.expire - now <= 3 * 24 * 3600:
+            warnings.append(f'expires on {stats.expire_str}')
+        if stats.over_quota:
+            warnings.append('quota exceeded')
+        elif not stats.unlimited and stats.remaining is not None and stats.percent >= 90:
+            warnings.append(f'{format_bytes(stats.remaining)} remaining')
+        if not warnings:
+            return
+        last = float(self.settings.value(f'quota_alert/{sub.id}', 0.0) or 0.0)
+        if now - last < 24 * 3600:
+            return
+        self.settings.setValue(f'quota_alert/{sub.id}', now)
+        self._notify_user(f'Subscription: {sub.name}', ', '.join(warnings))
+        self._append_log(f'Subscription alert for {sub.name}: {", ".join(warnings)}')
 
     def _subscription_update_worker(self, sub_id: str, url: str, name: str) -> None:
         try:
@@ -2008,12 +2766,21 @@ class MainWindow(QMainWindow):
             self.subscription_update_finished.emit(sub_id, [], {}, str(exc))
 
     def _on_subscription_update_finished(self, sub_id: str, profiles: object, headers_info: object, error: str) -> None:
+        self._subs_inflight.discard(sub_id)
+        silent = sub_id in self._subs_silent
+        self._subs_silent.discard(sub_id)
         sub = self.subscription_store.get(sub_id)
         sub_name = sub.name if sub else sub_id
         if error:
-            self._append_log(f"Failed to update subscription '{sub_name}': {error}")
-            self._show_error(f"Subscription update failed ({sub_name}): {error}")
+            failures = self._subscription_failures.get(sub_id, 0) + 1
+            self._subscription_failures[sub_id] = failures
+            self._subscription_retry_at[sub_id] = time.time() + min(6 * 3600, 600 * 2 ** (failures - 1))
+            self._append_log(f"Failed to update subscription '{sub_name}': {redact(error)}")
+            if not silent:
+                self._show_error(f"Subscription update failed ({sub_name}): {redact(error)}")
             return
+        self._subscription_failures.pop(sub_id, None)
+        self._subscription_retry_at.pop(sub_id, None)
         if not isinstance(profiles, list) or not profiles:
             self._append_log(f"Subscription '{sub_name}' returned no profiles")
             # Still persist quota info from the response headers when present.
@@ -2021,7 +2788,8 @@ class MainWindow(QMainWindow):
                 sub.user_info = headers_info["user_info"]
                 sub.updated_at = time.time()
                 self.subscription_store.put(sub)
-            self._show_error(f"Subscription '{sub_name}' returned no profiles")
+            if not silent:
+                self._show_error(f"Subscription '{sub_name}' returned no profiles")
             return
 
         loaded_profiles = [p for p in profiles if isinstance(p, Profile)]
@@ -2032,6 +2800,7 @@ class MainWindow(QMainWindow):
             if isinstance(headers_info, dict) and headers_info.get("user_info"):
                 sub.user_info = headers_info["user_info"]
             self.subscription_store.put(sub)
+            self._notify_quota(sub)
 
         self._apply_updated_subscription_profiles(sub_id, loaded_profiles)
         self._append_log(f"Updated subscription '{sub_name}': {len(loaded_profiles)} profile(s)")
@@ -2062,53 +2831,64 @@ class MainWindow(QMainWindow):
     def _apply_updated_subscription_profiles(self, sub_id: str, new_profiles: list[Profile]) -> None:
         if not new_profiles:
             return
+        old_nodes = [p for p in self.profiles if p.subscription_id == sub_id]
+        by_signature: dict[str, list[Profile]] = {}
+        by_endpoint: dict[tuple[str, str, str, str], list[Profile]] = {}
 
-        connected_profile = self.profiles[self.connected_index] if self.connected_index is not None and self.connected_index < len(self.profiles) else None
-        connected_key = self._profile_usage_key(connected_profile) if connected_profile else None
+        def endpoint(profile: Profile) -> tuple[str, str, str, str]:
+            ob = profile.outbound
+            return (str(ob.get('type', '')), str(ob.get('server', '')),
+                    str(ob.get('server_port', '')), profile.name)
 
-        new_list_profiles: list[Profile] = []
-        new_list_latencies: list[int | None] = []
-        new_list_usage: list[int] = []
+        for old in old_nodes:
+            by_signature.setdefault(self._profile_signature(old), []).append(old)
+            by_endpoint.setdefault(endpoint(old), []).append(old)
+        used_ids: set[str] = set()
+        for new in new_profiles:
+            new.subscription_id = sub_id
+            similar = by_signature.get(self._profile_signature(new), [])
+            if not similar:
+                similar = by_endpoint.get(endpoint(new), [])
+            match = next((old for old in similar if old.id not in used_ids), None)
+            if match is not None:
+                new.id = match.id
+                used_ids.add(match.id)
 
+        connected = (self.profiles[self.connected_index]
+                     if self.connected_index is not None and 0 <= self.connected_index < len(self.profiles)
+                     else None)
+        new_items: list[Profile] = []
         replaced = False
-        for i, p in enumerate(self.profiles):
-            if p.subscription_id == sub_id:
+        for profile in self.profiles:
+            if profile.subscription_id == sub_id:
                 if not replaced:
-                    for np in new_profiles:
-                        np.subscription_id = sub_id
-                        new_list_profiles.append(np)
-                        new_list_latencies.append(None)
-                        usage = int(self._usage_store.get(self._profile_usage_key(np), 0))
-                        new_list_usage.append(usage)
+                    new_items.extend(new_profiles)
                     replaced = True
             else:
-                new_list_profiles.append(p)
-                new_list_latencies.append(self.profile_latencies[i] if i < len(self.profile_latencies) else None)
-                new_list_usage.append(self.profile_usage_bytes[i] if i < len(self.profile_usage_bytes) else 0)
-
+                new_items.append(profile)
         if not replaced:
-            for np in new_profiles:
-                np.subscription_id = sub_id
-                new_list_profiles.append(np)
-                new_list_latencies.append(None)
-                usage = int(self._usage_store.get(self._profile_usage_key(np), 0))
-                new_list_usage.append(usage)
+            new_items.extend(new_profiles)
+        # The running TUN may still use a node removed by the subscription.
+        # Retain a detached entry so the UI/stats remain consistent until stopped.
+        if connected is not None and connected.subscription_id == sub_id and not any(
+            p.id == connected.id for p in new_items
+        ) and self.vpn.status in {'connected', 'connecting'}:
+            connected.subscription_id = None
+            connected.name += ' (active, removed from subscription)'
+            new_items.append(connected)
+            self._append_log('Active server disappeared from subscription; keeping current tunnel until disconnect.')
 
-        self.profiles = new_list_profiles
-        self.profile_latencies = new_list_latencies
-        self.profile_usage_bytes = new_list_usage
-
-        if connected_key is not None:
-            new_connected_idx = None
-            for idx, p in enumerate(self.profiles):
-                if self._profile_usage_key(p) == connected_key:
-                    new_connected_idx = idx
-                    break
-            self.connected_index = new_connected_idx
-
+        latency_by_id = {p.id: self.profile_latencies[i] if i < len(self.profile_latencies) else None
+                         for i, p in enumerate(self.profiles)}
+        current_usage = {p.id: self.profile_usage_bytes[i] if i < len(self.profile_usage_bytes) else 0
+                         for i, p in enumerate(self.profiles)}
+        self.profiles = new_items
+        self.profile_latencies = [latency_by_id.get(p.id) for p in new_items]
+        self.profile_usage_bytes = [current_usage.get(p.id, self._usage_store.get(p.id, 0)) for p in new_items]
+        if connected is not None:
+            self.connected_index = next((i for i, p in enumerate(new_items) if p.id == connected.id), None)
         self._pending_latency_indices = set(range(len(self.profiles)))
         self._save_profiles()
-        self._refresh_location_filter()
         self._refresh_profile_views()
         self.refresh_latencies()
 
@@ -2292,8 +3072,17 @@ class MainWindow(QMainWindow):
         payload: dict[str, Any] = {"name": profile.name, "outbound": profile.outbound}
         if profile.xray:
             payload["xray"] = profile.xray
+        confirmed = QMessageBox.warning(
+            self, 'Export VPN credentials',
+            'This configuration contains authentication credentials. Anyone with the exported '
+            'file may be able to use your VPN account. Export to a private, trusted location?',
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
+        )
+        if confirmed != QMessageBox.Yes:
+            return
         try:
-            target.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            atomic_private_json(target, payload)
+            ensure_user_owned(target)
         except OSError as exc:
             self._show_error(f"Failed to export profile: {exc}")
             return
@@ -2349,6 +3138,8 @@ class MainWindow(QMainWindow):
         duplicate_action = menu.addAction("Duplicate")
         export_action = menu.addAction("Export")
         delete_action = menu.addAction(f'Delete "{profile.name}"')
+        favorite_action = menu.addAction('Remove from favorites' if profile.id in self.favorite_profile_ids
+                                         else '★ Add to favorites')
         if self.vpn.status in {"connected", "connecting"} and self.connected_index == profile_index:
             connect_action.setText("Reconnect")
         selected_action = menu.exec(self.profile_list.viewport().mapToGlobal(pos))
@@ -2365,6 +3156,16 @@ class MainWindow(QMainWindow):
             self.export_selected_profile()
         elif selected_action is delete_action:
             self.delete_selected_profile()
+        elif selected_action is favorite_action:
+            self._toggle_favorite(profile.id)
+
+    def _toggle_favorite(self, profile_id: str) -> None:
+        if profile_id in self.favorite_profile_ids:
+            self.favorite_profile_ids.remove(profile_id)
+        else:
+            self.favorite_profile_ids.add(profile_id)
+        self.settings.setValue('ui/favorites', json.dumps(sorted(self.favorite_profile_ids)))
+        self._refresh_profile_views()
 
     def _apply_loaded_profiles(self, loaded: list[Profile], persist: bool = True) -> None:
         if not loaded:
@@ -2408,8 +3209,8 @@ class MainWindow(QMainWindow):
         self._connect_profile(index)
 
     def _connect_fastest(self) -> None:
-        if self.vpn.status in {"connected", "connecting", "disconnecting"}:
-            self.vpn.request_disconnect()
+        if self.vpn.status in {'connected', 'connecting', 'disconnecting'}:
+            self._stop_connection()
             return
         best = self._best_profile_index()
         if best is None:
@@ -2423,8 +3224,8 @@ class MainWindow(QMainWindow):
         self._connect_profile(best)
 
     def toggle_connection(self) -> None:
-        if self.vpn.status in {"connected", "connecting", "disconnecting"}:
-            self.vpn.request_disconnect()
+        if self.vpn.status in {'connected', 'connecting', 'disconnecting'}:
+            self._stop_connection()
             return
 
         index = self._selected_profile_index()
@@ -2448,6 +3249,10 @@ class MainWindow(QMainWindow):
         if routing.mode == "only_selected" and not (routing.domains or routing.ip_cidrs):
             self._show_error("Add at least one domain or IP/CIDR for 'Proxy only listed domains/IPs' mode.")
             return
+        if routing.app_mode != "disabled" and not (routing.app_process_names or routing.app_process_paths):
+            self._show_error("Select at least one application in the Applications tab.")
+            self._set_bottom_page(3)
+            return
         if routing.dns_mode == "custom" and not routing.custom_dns.strip():
             self._show_error("Enter a Custom DNS server address.")
             return
@@ -2456,11 +3261,12 @@ class MainWindow(QMainWindow):
         # and restarts the session itself without blocking the GUI thread.
         self._ensure_profile_visible(index)
         self._set_selected_profile_index(index)
-        self.connected_index = index
-        self._touch_profile_last_used(index)
+        switching = self.vpn.status == 'connected'
+        if not switching:
+            self.connected_index = index
         profile = self.profiles[index]
         self.vpn.connect_profile(profile, routing)
-        if self.vpn.status == "disconnected":
+        if self.vpn.status == 'disconnected' and not switching:
             self.connected_index = None
         self._refresh_profile_views()
 
@@ -2471,10 +3277,18 @@ class MainWindow(QMainWindow):
             mode=mode,
             dns_mode=str(self.dns_mode_combo.currentData() or "proxy"),
             custom_dns=self.custom_dns_edit.text().strip(),
+            auto_redirect=self.auto_redirect_checkbox.isChecked(),
             include_subdomains=self.include_subdomains_checkbox.isChecked(),
             ignore_ru_domains=self.ignore_ru_domains_checkbox.isChecked(),
             domains=domains,
             ip_cidrs=ip_cidrs,
+            app_mode=str(self.app_mode_combo.currentData() or "disabled"),
+            app_process_names=sorted(
+                {item["name"] for item in self._selected_application_rules() if item.get("name")}
+            ),
+            app_process_paths=sorted(
+                {item["path"] for item in self._selected_application_rules() if item.get("path")}
+            ),
         )
 
     def _on_profile_filter_changed(self) -> None:
@@ -2600,6 +3414,7 @@ class MainWindow(QMainWindow):
 
         timeout_sec = self.timeout_spin.value() / 1000.0
         snapshot = list(self.profiles)
+        self._active_scan_profile_ids = [p.id for p in snapshot]
         self._scan_in_progress = True
         self._pending_latency_refresh = False
         self._active_scan_id += 1
@@ -2635,16 +3450,33 @@ class MainWindow(QMainWindow):
             return
 
         self._scan_in_progress = False
-        if len(latencies) != len(self.profiles):
-            if self._pending_latency_refresh:
-                self.refresh_latencies()
+        if (len(latencies) != len(self.profiles)
+                or self._active_scan_profile_ids != [p.id for p in self.profiles]):
+            # Subscription refresh / drag-reorder changed membership or order
+            # while the asynchronous scan ran. Do not misattribute results.
+            self._last_latency_update_text = 'profiles changed — rescanning...'
+            self.refresh_latencies()
             return
 
         self.profile_latencies = latencies
         self._pending_latency_indices.clear()
         self._latency_has_results = True
-        self._last_latency_update_text = time.strftime("%H:%M:%S")
-        self._refresh_profile_views()
+        self._last_latency_update_text = time.strftime('%H:%M:%S')
+        for profile, ms in zip(self.profiles, latencies):
+            self.quality.record(profile.id, ms)
+        self._persist_quality_store()
+        if self.profile_sort_combo.currentData() in {'latency', 'quality'}:
+            self._refresh_profile_views()
+        else:
+            self._refresh_latency_update_labels()
+            self._refresh_profile_rows()
+        if self.connected_index is not None and self.connected_index < len(self.profiles):
+            quality = self.quality.quality(self.profiles[self.connected_index].id)
+            if quality:
+                jitter = f'{quality.jitter_ms:.0f}ms' if quality.jitter_ms is not None else '—'
+                self.quality_status_label.setText(
+                    f'Quality {quality.score:.0f}/100 • availability {quality.reliability:.0%} • jitter {jitter}')
+        self._maybe_auto_switch()
 
         if self._pending_latency_refresh:
             self.refresh_latencies()
@@ -2657,103 +3489,80 @@ class MainWindow(QMainWindow):
         )
 
     def _best_profile_index(self) -> int | None:
-        best_index: int | None = None
-        best_latency: int | None = None
-
-        if self._filters_active():
-            candidate_indices: list[int] | range = list(self._visible_profile_indices)
-        else:
-            candidate_indices = range(len(self.profiles))
-
-        for idx in candidate_indices:
-            if idx >= len(self.profile_latencies):
-                continue
-            latency = self.profile_latencies[idx]
-            if latency is None:
-                continue
-            if best_latency is None or latency < best_latency:
-                best_latency = latency
-                best_index = idx
-
-        return best_index
+        candidates = list(self._visible_profile_indices) if self._filters_active() else list(range(len(self.profiles)))
+        if not candidates:
+            return None
+        ids = [self.profiles[i].id for i in candidates]
+        latencies = [self.profile_latencies[i] if i < len(self.profile_latencies) else None for i in candidates]
+        best_in_candidates = self.quality.best(ids, latencies)
+        return candidates[best_in_candidates] if best_in_candidates is not None else None
 
     def _maybe_auto_switch(self) -> None:
-        if not self.auto_switch_checkbox.isChecked():
+        if not self.auto_switch_checkbox.isChecked() or self.vpn.status != 'connected':
             return
-        if self.vpn.status != "connected":
-            return
-        if self.connected_index is None:
-            return
-        if self.connected_index >= len(self.profiles):
-            return
-
-        self.refresh_latencies()
-        if not self.profile_latencies:
-            return
-
+        if self._last_switch_scan == self._active_scan_id:
+            return  # do not vote repeatedly for a stale latency scan
+        self._last_switch_scan = self._active_scan_id
         current = self.connected_index
-        current_latency = self.profile_latencies[current] if current < len(self.profile_latencies) else None
+        if current is None or current >= len(self.profiles):
+            return
         best = self._best_profile_index()
         if best is None or best == current:
-            if current_latency is not None and current_latency <= self.timeout_spin.value():
-                self._timeout_streak = 0
+            self._switch_candidate = None
+            self._switch_candidate_votes = 0
             return
-
-        if current_latency is None or current_latency > self.timeout_spin.value():
-            self._timeout_streak += 1
+        cid = self.profiles[best].id
+        if self._switch_candidate != cid:
+            self._switch_candidate = cid
+            self._switch_candidate_votes = 1
         else:
-            self._timeout_streak = 0
-
-        best_latency = self.profile_latencies[best]
-        if best_latency is None:
+            self._switch_candidate_votes += 1
+        if self._switch_candidate_votes < 2:
             return
-
-        should_switch = False
-        if current_latency is None and self._timeout_streak >= 2:
-            should_switch = True
-        elif current_latency is not None:
-            if current_latency > self.timeout_spin.value():
-                should_switch = True
-            elif best_latency + 120 < current_latency:
-                should_switch = True
-
-        cooldown_ok = (time.monotonic() - self._last_auto_switch) >= 20.0
-        if should_switch and cooldown_ok:
-            self._last_auto_switch = time.monotonic()
-            self._append_log(
-                f"Auto switch: {self.profiles[current].name} -> {self.profiles[best].name} "
-                f"({current_latency if current_latency is not None else 'timeout'} -> {best_latency} ms)"
-            )
-            self._set_selected_profile_index(best)
-            self._connect_profile(best)
+        current_quality = self.quality.quality(self.profiles[current].id)
+        candidate_quality = self.quality.quality(cid)
+        current_rtt = self.profile_latencies[current]
+        candidate_rtt = self.profile_latencies[best]
+        if not should_switch(current_quality, candidate_quality,
+                             current_latency=current_rtt, candidate_latency=candidate_rtt):
+            return
+        if time.monotonic() - self._last_auto_switch < 90.0:
+            return
+        self._last_auto_switch = time.monotonic()
+        self._switch_candidate_votes = 0
+        self._append_log(f'Smart Connect: testing a switch to {self.profiles[best].name}; '
+                         'the current tunnel remains active during preflight')
+        self._connect_profile(best)
 
     def _on_traffic_tick(self) -> None:
-        if self.vpn.status != "connected":
+        now = time.monotonic()
+        if self.vpn.status != 'connected' or self.connected_index is None or self.connected_index >= len(self.profiles):
             self._traffic_last_total = None
+            self._last_traffic_counters = None
+            self._last_traffic_sample = now
+            self.traffic_label.setText('↓ 0 B/s     ↑ 0 B/s')
             return
-        if self.connected_index is None or self.connected_index >= len(self.profiles):
-            self._traffic_last_total = None
-            return
-
         counters = self._read_interface_counters()
         if counters is None:
             return
-        total = counters[0] + counters[1]
-        if self._traffic_last_total is None:
-            self._traffic_last_total = total
+        previous, self._last_traffic_counters = self._last_traffic_counters, counters
+        elapsed = max(0.2, now - self._last_traffic_sample)
+        self._last_traffic_sample = now
+        if previous is None:
             return
-
-        delta = total - self._traffic_last_total
-        self._traffic_last_total = total
-        if delta <= 0:
+        down = max(0, counters[0] - previous[0])
+        up = max(0, counters[1] - previous[1])
+        self.traffic_chart.add_sample(down / elapsed, up / elapsed)
+        self.traffic_label.setText(
+            f'↓ {self._format_bytes(int(down / elapsed))}/s     '
+            f'↑ {self._format_bytes(int(up / elapsed))}/s')
+        if down + up == 0:
             return
-
         idx = self.connected_index
-        self.profile_usage_bytes[idx] += delta
-        key = self._profile_usage_key(self.profiles[idx])
-        self._usage_store[key] = self.profile_usage_bytes[idx]
+        self.profile_usage_bytes[idx] += down + up
+        self._usage_store[self.profiles[idx].id] = self.profile_usage_bytes[idx]
         self._usage_dirty = True
-        self._refresh_profile_views()
+        self._refresh_profile_rows(idx)
         self._persist_usage_store()
 
     def _connection_warmup_worker(self) -> None:
@@ -2773,17 +3582,98 @@ class MainWindow(QMainWindow):
             if res2 and res2.get("ok"):
                 self.worker_log.emit(f"[Probe] Tunnel verified: {res2.get('latency_ms')} ms")
 
+    def _on_vpn_profile_starting(self, profile: object) -> None:
+        if not isinstance(profile, Profile):
+            return
+        self._desired_profile_id = profile.id
+        index = next((i for i, p in enumerate(self.profiles) if p.id == profile.id), None)
+        if index is not None:
+            self.connected_index = index
+            self._touch_profile_last_used(index)
+        self._refresh_profile_rows()
+        self._update_tray_menu()
+
+    def _stop_connection(self) -> None:
+        self._desired_profile_id = None
+        self._reconnect_timer.stop()
+        self._reconnect_attempts = 0
+        self.vpn.request_disconnect()
+
+    def _on_connection_lost(self, reason: str) -> None:
+        if not self.auto_reconnect_checkbox.isChecked() or not self._desired_profile_id:
+            return
+        if self._reconnect_attempts >= 5:
+            self._append_log('Automatic recovery stopped after five attempts. Check diagnostics.')
+            self._notify_user('Connection lost', 'Automatic recovery exhausted; reconnect manually.')
+            return
+        delay = min(45, 2 ** (self._reconnect_attempts + 1))
+        self._reconnect_attempts += 1
+        self._append_log(f'{reason}; retry {self._reconnect_attempts}/5 in {delay} seconds')
+        self._reconnect_timer.start(delay * 1000)
+
+    def _attempt_reconnect(self) -> None:
+        if self.vpn.status != 'disconnected' or not self._desired_profile_id:
+            return
+        index = next((i for i, p in enumerate(self.profiles) if p.id == self._desired_profile_id), None)
+        if index is not None:
+            self._connect_profile(index)
+
+    def run_diagnostics(self) -> None:
+        if self._diag_running:
+            return
+        self._diag_running = True
+        self.diag_run_btn.setEnabled(False)
+        self.diagnostic_summary.setText('Running safe tunnel checks...')
+        connected = self.vpn.status == 'connected'
+        pid = int(self.vpn.process.processId()) if connected else None
+
+        def worker() -> None:
+            try:
+                data = connected_diagnostics(connected=connected, interface=IFACE_NAME,
+                                             process_pid=pid)
+            except Exception as exc:
+                data = {'error': redact(str(exc)), 'vpn_running': connected}
+            self.diagnostics_ready.emit(data)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_diagnostics_ready(self, data: object) -> None:
+        self._diag_running = False
+        self.diag_run_btn.setEnabled(True)
+        if not isinstance(data, dict):
+            data = {'error': 'Invalid diagnostics response'}
+        safe = redacted_structure(data)
+        self.diag_details.setPlainText(json.dumps(safe, indent=2, ensure_ascii=False))
+        if safe.get('external_ip'):
+            self.diagnostic_summary.setText(
+                f"TUN: {'up' if safe.get('interface_up') else 'down'} • "
+                f"External IP: {safe['external_ip']} • "
+                f"RTT: {safe.get('latency_ms') or '—'} ms • "
+                f"DNS: {'OK' if safe.get('dns_ok') else 'FAILED'}")
+        else:
+            self.diagnostic_summary.setText(str(safe.get('message') or safe.get('error') or 'Connection not verified'))
+
+    def copy_diagnostic_report(self) -> None:
+        text = self.diag_details.toPlainText() or 'No diagnostics collected yet.'
+        QApplication.clipboard().setText(redact(text))
+        self._notify_user('Diagnostics', 'Sanitized connection report copied.')
+
     def _on_vpn_status_changed(self, status: str) -> None:
         self._last_vpn_status = status
         self._set_status(status)
         self._refresh_profile_views()
-        if status == "connected" and self.connected_index is not None:
-            threading.Thread(target=self._connection_warmup_worker, daemon=True).start()
-        elif status == "disconnected":
+        if status == 'connected':
+            self._reconnect_attempts = 0
+            if self.connected_index is not None:
+                threading.Thread(target=self._connection_warmup_worker, daemon=True).start()
+        elif status == 'disconnected':
             self.connected_index = None
             self._timeout_streak = 0
             self._traffic_last_total = None
+            self._last_traffic_counters = None
+            self.traffic_chart.reset()
             self._persist_usage_store(force=True)
+        self._update_tray_menu()
 
     def _set_status(self, status: str) -> None:
         mapping = {
@@ -2834,7 +3724,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{status_text} • {len(self.profiles)} profiles • {sub_count} subscriptions")
 
     def copy_logs(self) -> None:
-        QApplication.clipboard().setText(self.logs.toPlainText())
+        QApplication.clipboard().setText(redact(self.logs.toPlainText()))
         self._notify_user("Logs copied", "Current logs copied to clipboard")
 
     def clear_logs(self) -> None:
@@ -2846,6 +3736,7 @@ class MainWindow(QMainWindow):
         if not path.exists():
             try:
                 path.touch()
+                path.chmod(0o600)
                 ensure_user_owned(path)
             except OSError as exc:
                 self._show_error(f"Failed to prepare log file: {exc}")
@@ -2858,8 +3749,9 @@ class MainWindow(QMainWindow):
         self._notify_user("Log file", str(path))
 
     def _append_log(self, text: str) -> None:
-        self.logs.append(text)
-        logging.info(text)
+        safe = redact(text)
+        self.logs.appendPlainText(safe)
+        logging.info(safe)
 
     def event(self, event) -> bool:  # type: ignore[override]
         if event.type() == QEvent.Type.FileOpen:
@@ -2871,14 +3763,17 @@ class MainWindow(QMainWindow):
         return super().event(event)
 
     def _show_error(self, message: str) -> None:
-        QMessageBox.critical(self, "Error", message)
-        self.logs.append(f"ERROR: {message}")
-        logging.error(message)
+        safe = redact(message)
+        QMessageBox.critical(self, 'Error', safe)
+        self._append_log(f'ERROR: {safe}')
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._persist_usage_store(force=True)
         self._persist_last_used_store()
+        self._persist_quality_store(force=True)
+        self._reconnect_timer.stop()
         self.settings.sync()
-        ensure_user_owned(settings_path())
+        self._protect_settings_file()
+        self._subscription_pool.shutdown(wait=False, cancel_futures=True)
         self.vpn.disconnect()
         super().closeEvent(event)

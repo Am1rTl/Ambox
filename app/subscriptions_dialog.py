@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -32,6 +33,7 @@ class SubscriptionCard(QWidget):
     """Compact one-row subscription card: name, status, traffic bar, remaining."""
 
     update_requested = Signal(str)
+    auto_update_changed = Signal(str, bool)
     rename_requested = Signal(str)
     delete_requested = Signal(str)
 
@@ -73,6 +75,11 @@ class SubscriptionCard(QWidget):
             btn.setToolTip(tip)
             btn.clicked.connect(lambda _checked=False, s=signal: s.emit(self.sub_id))
             top_row.addWidget(btn)
+        auto_check = QCheckBox('Auto')
+        auto_check.setChecked(sub.auto_update)
+        auto_check.setToolTip('Allow scheduled updates; manual update remains available')
+        auto_check.toggled.connect(lambda checked: self.auto_update_changed.emit(self.sub_id, checked))
+        top_row.addWidget(auto_check)
         outer.addLayout(top_row)
 
         bottom_row = QHBoxLayout()
@@ -318,6 +325,7 @@ class SubscriptionsDialog(QDialog):
             card.update_requested.connect(self._on_card_update)
             card.rename_requested.connect(self._on_card_rename)
             card.delete_requested.connect(self._on_card_delete)
+            card.auto_update_changed.connect(self._on_card_auto_update)
             item = QListWidgetItem()
             item.setData(Qt.UserRole, sub.id)
             item.setSizeHint(card.sizeHint())
@@ -345,6 +353,12 @@ class SubscriptionsDialog(QDialog):
     def _on_card_delete(self, sub_id: str) -> None:
         self._select_sub_id(sub_id)
         self._on_delete()
+
+    def _on_card_auto_update(self, sub_id: str, enabled: bool) -> None:
+        sub = self.main_window.subscription_store.get(sub_id)
+        if sub is not None:
+            sub.auto_update = enabled
+            self.main_window.subscription_store.put(sub)
 
     def _selected_sub_id(self) -> str | None:
         item = self.list_widget.currentItem()

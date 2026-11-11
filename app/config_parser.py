@@ -2,6 +2,7 @@ import base64
 import binascii
 import ipaddress
 import json
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -21,6 +22,8 @@ class Profile:
     subscription_id: str | None = None
     # Full Xray config (outbounds + routing + balancers) for Happ-style subscriptions.
     xray: dict[str, Any] | None = None
+    # Stable random local identifier; never contains credentials.
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 @dataclass
@@ -30,8 +33,15 @@ class RoutingOptions:
     ignore_ru_domains: bool = False
     dns_mode: str = "proxy"
     custom_dns: str = ""
+    auto_redirect: bool = False
     domains: list[str] = field(default_factory=list)
     ip_cidrs: list[str] = field(default_factory=list)
+    # Optional per-application routing.  The process rules are deliberately
+    # separate from domain/IP rules: sing-box matches the first route rule,
+    # so application rules can be given a clear, documented precedence.
+    app_mode: str = "disabled"
+    app_process_names: list[str] = field(default_factory=list)
+    app_process_paths: list[str] = field(default_factory=list)
 
 
 class ConfigError(Exception):
@@ -1066,6 +1076,18 @@ def build_singbox_config(
     if server_ips:
         rules.append({"ip_cidr": sorted(server_ips), "outbound": "direct"})
 
+    app_mode = routing.app_mode if routing.app_mode in {"disabled", "proxy_selected", "direct_selected"} else "disabled"
+    if app_mode != "disabled":
+        process_names = sorted({str(value).strip() for value in routing.app_process_names if str(value).strip()})
+        process_paths = sorted({str(value).strip() for value in routing.app_process_paths if str(value).strip()})
+        app_outbound = proxy_tag if app_mode == "proxy_selected" else "direct"
+        # Keep name and path in separate rules.  A sing-box route rule combines
+        # fields, while the UI treats a selected executable as name OR path.
+        if process_names:
+            rules.append({"process_name": process_names, "outbound": app_outbound})
+        if process_paths:
+            rules.append({"process_path": process_paths, "outbound": app_outbound})
+
     if routing.ignore_ru_domains:
         rules.append({"domain_suffix": [RU_DOMAIN_SUFFIX], "outbound": "direct"})
         if dns_mode == "proxy" and dns_config is not None:
@@ -1126,6 +1148,9 @@ def build_singbox_config(
         },
         "outbounds": outbounds,
     }
+    if routing.auto_redirect:
+        # This feature is opt-in: Linux host must provide nftables support.
+        config['inbounds'][0]['auto_redirect'] = True
     if bundle is not None and mode != "only_selected" and bundle.rule_sets:
         config["route"]["rule_set"] = [
             {"type": "local", "tag": tag, "format": "binary", "path": str(rule_set_path(kind, name))}

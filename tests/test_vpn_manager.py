@@ -36,35 +36,69 @@ def test_request_disconnect_on_idle_manager(vpn):
     assert vpn.status == "disconnected"
 
 
-def test_connect_queues_switch_when_busy(monkeypatch, vpn):
-    monkeypatch.setattr(vpn.process, "state", lambda: QProcess.ProcessState.Running)
-    monkeypatch.setattr("app.vpn_manager.QTimer.singleShot", lambda *args: None)
+def _defer_preflight(monkeypatch, vpn):
+    """Deterministic tests for the hand-off: no worker or real sing-box needed."""
+    monkeypatch.setattr(vpn, '_resolve_singbox', lambda: '/usr/bin/sing-box')
+    monkeypatch.setattr(vpn, 'singbox_version', lambda: (1, 14, 0))
+
+    class DeferredWorker:
+        def __init__(self, *, target, args, daemon):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr('app.vpn_manager.threading.Thread', DeferredWorker)
+
+
+def test_switch_preflight_preserves_active_connection_on_error(monkeypatch, vpn):
+    _defer_preflight(monkeypatch, vpn)
+    vpn._set_status('connected')
+    monkeypatch.setattr(vpn.process, 'state', lambda: QProcess.ProcessState.Running)
     profile = _profile()
     vpn.connect_profile(profile)
     assert vpn._pending_connect == (profile, None)
-    assert vpn.status == "disconnecting"
+    assert vpn.status == 'connected'  # no stop until validation finishes
+    generation = vpn._connect_generation
+    vpn._on_prepared(generation, None, 'broken config', profile)
+    assert vpn.status == 'connected'
+    assert vpn._pending_connect is None
+    assert vpn._pending_validated is None
 
 
-def test_explicit_stop_cancels_queued_switch(monkeypatch, vpn):
-    monkeypatch.setattr(vpn.process, "state", lambda: QProcess.ProcessState.Running)
-    monkeypatch.setattr("app.vpn_manager.QTimer.singleShot", lambda *args: None)
+def test_explicit_stop_cancels_switch_preflight(monkeypatch, vpn):
+    _defer_preflight(monkeypatch, vpn)
+    vpn._set_status('connected')
+    monkeypatch.setattr(vpn.process, 'state', lambda: QProcess.ProcessState.Running)
+    monkeypatch.setattr('app.vpn_manager.QTimer.singleShot', lambda *args: None)
     vpn.connect_profile(_profile())
+    generation = vpn._connect_generation
     assert vpn._pending_connect is not None
     vpn.request_disconnect()
     assert vpn._pending_connect is None
+    assert vpn._pending_validated is None
+    assert vpn._preparing_switch is None
+    assert vpn._connect_generation > generation
 
 
-def test_pending_switch_starts_when_session_finishes(monkeypatch, vpn):
-    monkeypatch.setattr(vpn.process, "state", lambda: QProcess.ProcessState.Running)
-    monkeypatch.setattr("app.vpn_manager.QTimer.singleShot", lambda *args: None)
+def test_validated_switch_starts_after_old_session_finishes(monkeypatch, vpn):
+    _defer_preflight(monkeypatch, vpn)
+    vpn._set_status('connected')
+    monkeypatch.setattr(vpn.process, 'state', lambda: QProcess.ProcessState.Running)
+    monkeypatch.setattr('app.vpn_manager.QTimer.singleShot', lambda *args: None)
     profile = _profile()
     vpn.connect_profile(profile)
+    checked_config = {'inbounds': [], 'outbounds': []}
+    vpn._on_prepared(vpn._connect_generation, checked_config, '/usr/bin/sing-box', profile)
+    assert vpn.status == 'disconnecting'
+    assert vpn._pending_validated == (checked_config, '/usr/bin/sing-box', profile)
 
     started = []
-    monkeypatch.setattr(vpn, "connect_profile", lambda p, r=None: started.append((p, r)))
-    monkeypatch.setattr(vpn.process, "state", lambda: QProcess.ProcessState.NotRunning)
+    monkeypatch.setattr(vpn, '_launch_prepared', lambda *args: started.append(args))
+    monkeypatch.setattr(vpn.process, 'state', lambda: QProcess.ProcessState.NotRunning)
     vpn._on_finished()
-    assert started == [(profile, None)]
+    assert started == [(checked_config, '/usr/bin/sing-box', profile)]
 
 
 def test_singbox_version_is_cached(vpn):
@@ -129,3 +163,43 @@ def test_custom_dns_probe_tries_all_resolved_addresses(monkeypatch, vpn):
     monkeypatch.setattr(vpn, "_probe_dns_server", probe)
     assert vpn._prepare_custom_dns("dns.example") == "udp://[2001:db8::1]:53"
     assert len(attempts) == 2
+
+
+def test_preflight_checks_real_private_config_and_removes_tempfile(monkeypatch, vpn):
+    import json
+    import os
+    import subprocess
+    from pathlib import Path
+
+    seen = []
+
+    def simulate_check(argv, **kwargs):
+        assert argv[0] == '/usr/bin/sing-box'
+        assert argv[1:3] == ['check', '-c']
+        path = Path(argv[3])
+        assert path.exists()
+        if os.name == 'posix':
+            assert path.stat().st_mode & 0o777 == 0o600
+        assert json.loads(path.read_text()) == {'password': 'private'}
+        seen.append(path)
+        return subprocess.CompletedProcess(argv, 0, '', '')
+
+    monkeypatch.setattr('app.vpn_manager.subprocess.run', simulate_check)
+    vpn.validate_config('/usr/bin/sing-box', {'password': 'private'})
+    assert len(seen) == 1 and not seen[0].exists()
+
+
+def test_preflight_error_redacts_credentials_and_cleans_tempfile(monkeypatch, vpn):
+    import subprocess
+    from pathlib import Path
+    seen = []
+
+    def simulate_failure(argv, **kwargs):
+        seen.append(Path(argv[3]))
+        return subprocess.CompletedProcess(argv, 1, '', 'ERROR password=do-not-share')
+
+    monkeypatch.setattr('app.vpn_manager.subprocess.run', simulate_failure)
+    with pytest.raises(ValueError, match='rejected') as exc:
+        vpn.validate_config('/usr/bin/sing-box', {'password': 'do-not-share'})
+    assert 'do-not-share' not in str(exc.value)
+    assert seen and not seen[0].exists()
