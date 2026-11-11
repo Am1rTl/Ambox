@@ -3090,6 +3090,14 @@ class MainWindow(QMainWindow):
             return
 
         index = self._selected_profile_index()
+        if index is None:
+            # The Configs page starts on "My configs"; an account with only
+            # subscription nodes still needs a working Connect button.
+            quick_index = self.quick_profile_combo.currentData()
+            if isinstance(quick_index, int) and 0 <= quick_index < len(self.profiles):
+                index = quick_index
+            elif self.profiles:
+                index = 0
         if self.auto_switch_checkbox.isChecked():
             best = self._best_profile_index()
             if best is not None:
@@ -3507,6 +3515,9 @@ class MainWindow(QMainWindow):
             index = self.connected_index
         else:
             index = self._selected_profile_index()
+            if index is None:
+                quick_index = self.quick_profile_combo.currentData()
+                index = quick_index if isinstance(quick_index, int) else None
         if index is None or index < 0 or index >= len(self.profiles):
             self.vpn_profile_label.setText(f"{len(self.profiles)} profile(s) available")
             return
