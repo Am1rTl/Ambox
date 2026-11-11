@@ -154,3 +154,20 @@ def test_ignore_ru_with_proxy_dns_has_unique_dns_tags() -> None:
     )
     tags = [server["tag"] for server in config["dns"]["servers"]]
     assert len(tags) == len(set(tags))
+
+
+def test_ru_bypass_has_priority_over_happ_provider_rules() -> None:
+    profile = load_profiles_from_text(json.dumps([_happ_config()]))[0]
+    config = build_singbox_config(
+        profile.outbound,
+        RoutingOptions(ignore_ru_domains=True, dns_mode="custom", custom_dns="1.1.1.1"),
+        xray=profile.xray,
+        rule_set_available=lambda kind, name: (kind, name) == ("geosite", "youtube"),
+    )
+    rules = config["route"]["rules"]
+    ru = {"domain_suffix": [".ru"], "outbound": "direct"}
+    assert ru in rules
+    assert rules.index(ru) < next(i for i, rule in enumerate(rules) if "rule_set" in rule)
+    assert config["dns"]["rules"][0] == {
+        "domain_suffix": [".ru"], "action": "route", "server": "direct-dns"
+    }

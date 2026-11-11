@@ -1082,6 +1082,20 @@ def build_singbox_config(
     if server_ips:
         rules.append({"ip_cidr": sorted(server_ips), "outbound": "direct"})
 
+    # Global exception: .ru must win over process selectors, manual domain
+    # presets, Xray/Happ provider rules, and the final route in *every* mode.
+    # Domain matching requires a visible hostname (DNS request or sniffed SNI).
+    if routing.ignore_ru_domains:
+        rules.append({"domain_suffix": [RU_DOMAIN_SUFFIX], "outbound": "direct"})
+        # Also override the DNS choice, even when custom/proxy DNS is selected.
+        # Do not let a provider DNS rule or proxy DNS resolve .ru via VPN.
+        if dns_config is not None:
+            dns_config.setdefault("rules", []).insert(0, {
+                "domain_suffix": [RU_DOMAIN_SUFFIX],
+                "action": "route",
+                "server": "direct-dns",
+            })
+
     udp_ok = bundle is not None or _supports_udp(proxy_outbounds[0])
     if app_mode != "disabled":
         process_names = sorted({str(value).strip() for value in routing.app_process_names if str(value).strip()})
@@ -1103,13 +1117,6 @@ def build_singbox_config(
             if ip_cidrs:
                 rules.append({"ip_cidr": ip_cidrs, "outbound": "direct"})
     else:
-        if routing.ignore_ru_domains:
-            rules.append({"domain_suffix": [RU_DOMAIN_SUFFIX], "outbound": "direct"})
-            if dns_mode == "proxy" and dns_config is not None:
-                dns_config["rules"] = [
-                    {"domain_suffix": [RU_DOMAIN_SUFFIX], "action": "route", "server": "direct-dns"}
-                ]
-
         if mode == "only_selected":
             final_outbound = "direct"
             targets = ((rule_key, domains), ("ip_cidr", ip_cidrs))
