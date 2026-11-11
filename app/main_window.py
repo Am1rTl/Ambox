@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-from PySide6.QtCore import QEvent, QSettings, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QFileInfo, QSize, QSettings, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFileIconProvider,
     QFrame,
     QHBoxLayout,
     QInputDialog,
@@ -39,6 +40,8 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
+    QStyle,
     QSpinBox,
     QStackedWidget,
     QSystemTrayIcon,
@@ -48,6 +51,8 @@ from PySide6.QtWidgets import (
 )
 
 from app.app_paths import ensure_user_owned, import_configs_dir, log_path, profiles_path, settings_path
+from app.desktop_apps import DesktopApp, identity, installed_applications, merge_applications, running_applications
+from app.theme import STYLESHEET
 from app.security import atomic_private_json, redact, redacted_structure
 from app.quality import QualityTracker, should_switch
 from app.profile_sources import profile_indices_for_source
@@ -155,8 +160,8 @@ class MainWindow(QMainWindow):
     def __init__(self, initial_link: str | None = None) -> None:
         super().__init__()
         self.setWindowTitle("ambox")
-        self.resize(520, 710)
-        self.setMinimumSize(370, 540)
+        self.resize(540, 720)
+        self.setMinimumSize(400, 565)
         self._app_icon = self._build_app_icon()
         self.setWindowIcon(self._app_icon)
 
@@ -206,6 +211,8 @@ class MainWindow(QMainWindow):
         self._subscription_failures: dict[str, int] = {}
         self._last_quota_notice: dict[str, float] = {}
         self._diag_running = False
+        self._installed_apps: list[DesktopApp] | None = None
+        self._desktop_icons: dict[str, QIcon] = {}
 
         self.subscription_store = SubscriptionStore()
         self._selected_location = "ALL"
@@ -272,24 +279,30 @@ class MainWindow(QMainWindow):
         root.setAcceptDrops(True)
 
         main = QVBoxLayout(root)
-        main.setContentsMargins(8, 8, 8, 8)
-        main.setSpacing(6)
+        main.setContentsMargins(12, 8, 12, 10)
+        main.setSpacing(0)
 
         phone_shell = QFrame()
         phone_shell.setObjectName("phoneShell")
         phone_layout = QVBoxLayout(phone_shell)
-        phone_layout.setContentsMargins(6, 6, 6, 6)
-        phone_layout.setSpacing(7)
+        phone_layout.setContentsMargins(0, 0, 0, 0)
+        phone_layout.setSpacing(10)
 
         header = QFrame()
         header.setObjectName("headerCard")
-        header_layout = QVBoxLayout(header)
-        header_layout.setContentsMargins(12, 10, 12, 10)
-        header_layout.setSpacing(6)
-
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(6, 8, 6, 12)
+        header_layout.setSpacing(8)
+        logo = QLabel()
+        logo.setPixmap(self._app_icon.pixmap(QSize(28, 28)))
+        header_layout.addWidget(logo)
         title = QLabel('ambox')
         title.setObjectName('panelTitle')
-        header_layout.addWidget(title, 0, Qt.AlignLeft)
+        header_layout.addWidget(title)
+        header_layout.addStretch(1)
+        brand_caption = QLabel('VPN  ·  Linux')
+        brand_caption.setObjectName('brandHint')
+        header_layout.addWidget(brand_caption)
 
         phone_layout.addWidget(header)
 
@@ -299,7 +312,7 @@ class MainWindow(QMainWindow):
 
         connect_tab = QWidget()
         connect_layout = QVBoxLayout(connect_tab)
-        connect_layout.setContentsMargins(10, 10, 10, 10)
+        connect_layout.setContentsMargins(4, 4, 4, 4)
         connect_layout.setSpacing(10)
 
         self.vpn_status_card = QFrame()
@@ -318,21 +331,22 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("Disconnected")
         self.status_label.setObjectName("statusLabel")
         vpn_status_text.addWidget(self.status_label)
-        self.vpn_profile_label = QLabel("No profiles yet")
+        self.vpn_profile_label = QLabel("Добавьте подписку или конфиг")
         self.vpn_profile_label.setObjectName("softHint")
         self.vpn_profile_label.setWordWrap(True)
         vpn_status_text.addWidget(self.vpn_profile_label)
         vpn_status_layout.addLayout(vpn_status_text, 1)
         connect_layout.addWidget(self.vpn_status_card)
 
-        connect_layout.addSpacing(8)
+        connect_layout.addSpacing(0)
 
-        self.connect_btn = QPushButton("Connect")
+        self.connect_btn = QPushButton("Подключить")
         self.connect_btn.setObjectName("connectBtn")
-        self.connect_btn.setFixedSize(140, 100)
+        self.connect_btn.setMinimumHeight(48)
+        self.connect_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.connect_btn.setProperty("vpnState", "disconnected")
         self.connect_btn.clicked.connect(self.toggle_connection)
-        connect_layout.addWidget(self.connect_btn, 0, Qt.AlignHCenter)
+        connect_layout.addWidget(self.connect_btn)
 
         self.install_card = QFrame()
         self.install_card.setObjectName("warningCard")
@@ -357,16 +371,16 @@ class MainWindow(QMainWindow):
         vpn_empty_layout = QVBoxLayout(self.vpn_empty_frame)
         vpn_empty_layout.setContentsMargins(12, 12, 12, 12)
         vpn_empty_layout.setSpacing(8)
-        vpn_empty_label = QLabel("No profiles yet.\nAdd a subscription or import a config to get started.")
+        vpn_empty_label = QLabel("Пока нет серверов.\nДобавьте подписку или импортируйте конфиг.")
         vpn_empty_label.setObjectName("emptyState")
         vpn_empty_label.setAlignment(Qt.AlignCenter)
         vpn_empty_label.setWordWrap(True)
         vpn_empty_layout.addWidget(vpn_empty_label)
         vpn_empty_buttons = QHBoxLayout()
         vpn_empty_buttons.setSpacing(8)
-        vpn_add_sub_btn = QPushButton("➕ Add subscription")
+        vpn_add_sub_btn = QPushButton("Добавить подписку")
         vpn_add_sub_btn.clicked.connect(self.add_subscription_dialog)
-        vpn_paste_btn = QPushButton("Paste clipboard")
+        vpn_paste_btn = QPushButton("Из буфера")
         vpn_paste_btn.clicked.connect(self.import_from_clipboard)
         vpn_empty_buttons.addWidget(vpn_add_sub_btn)
         vpn_empty_buttons.addWidget(vpn_paste_btn)
@@ -374,43 +388,52 @@ class MainWindow(QMainWindow):
         self.vpn_empty_frame.setVisible(False)
         connect_layout.addWidget(self.vpn_empty_frame)
 
-        connect_layout.addSpacing(8)
+        connect_layout.addSpacing(0)
 
         self.quick_profile_frame = QFrame()
         self.quick_profile_frame.setObjectName("quickProfileCard")
         quick_profile_layout = QVBoxLayout(self.quick_profile_frame)
-        quick_profile_layout.setContentsMargins(10, 10, 10, 10)
+        quick_profile_layout.setContentsMargins(12, 10, 12, 10)
         quick_profile_layout.setSpacing(6)
 
-        quick_profile_label = QLabel("Active profile")
+        quick_profile_label = QLabel("Выберите сервер")
         quick_profile_label.setObjectName("quickProfileTitle")
         quick_profile_layout.addWidget(quick_profile_label)
+        quick_profile_row = QHBoxLayout()
+        quick_profile_row.setSpacing(7)
 
         self.quick_profile_combo = QComboBox()
         self.quick_profile_combo.setObjectName("quickProfileCombo")
         self.quick_profile_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.quick_profile_combo.setMinimumContentsLength(14)
-        quick_profile_layout.addWidget(self.quick_profile_combo)
+        quick_profile_row.addWidget(self.quick_profile_combo, 1)
 
         self.quick_profile_latency_label = QLabel("Latency update: never")
         self.quick_profile_latency_label.setObjectName("softHint")
-        quick_profile_layout.addWidget(self.quick_profile_latency_label)
+        self.quick_profile_latency_label.hide()
 
-        self.fastest_btn = QPushButton("⚡ Connect best")
+        self.fastest_btn = QPushButton("Лучший")
         self.fastest_btn.setToolTip("Connect to the highest-quality available profile (Ctrl+F)")
         self.fastest_btn.clicked.connect(self._connect_fastest)
-        quick_profile_layout.addWidget(self.fastest_btn)
+        quick_profile_row.addWidget(self.fastest_btn)
+        quick_profile_layout.addLayout(quick_profile_row)
 
         self.quick_profile_frame.setVisible(False)
         connect_layout.addWidget(self.quick_profile_frame)
 
+        self.app_quick_btn = QPushButton('Приложения  ·  Весь трафик')
+        self.app_quick_btn.setObjectName('quickLink')
+        self.app_quick_btn.setToolTip('Выбрать, какие приложения использовать через VPN')
+        self.app_quick_btn.clicked.connect(lambda: self._set_bottom_page(3))
+        connect_layout.addWidget(self.app_quick_btn)
+
         self.traffic_card = QFrame()
         self.traffic_card.setObjectName('metricCard')
         traffic_layout = QVBoxLayout(self.traffic_card)
-        traffic_layout.setContentsMargins(12, 10, 12, 10)
-        traffic_layout.setSpacing(7)
+        traffic_layout.setContentsMargins(12, 11, 12, 10)
+        traffic_layout.setSpacing(6)
         traffic_header = QHBoxLayout()
-        traffic_title = QLabel('LIVE TRAFFIC')
+        traffic_title = QLabel('ТРАФИК В РЕАЛЬНОМ ВРЕМЕНИ')
         traffic_title.setObjectName('fieldLabel')
         traffic_header.addWidget(traffic_title)
         traffic_header.addStretch(1)
@@ -419,12 +442,13 @@ class MainWindow(QMainWindow):
         traffic_header.addWidget(self.traffic_label)
         traffic_layout.addLayout(traffic_header)
         self.traffic_chart = TrafficChart(self.traffic_card)
+        self.traffic_chart.setFixedHeight(102)
         traffic_layout.addWidget(self.traffic_chart)
         quality_row = QHBoxLayout()
-        self.quality_status_label = QLabel('Quality: awaiting measurements')
+        self.quality_status_label = QLabel('Ожидаем измерений')
         self.quality_status_label.setObjectName('softHint')
         quality_row.addWidget(self.quality_status_label, 1)
-        health_btn = QPushButton('Run diagnostics')
+        health_btn = QPushButton('Диагностика')
         health_btn.clicked.connect(lambda: (self._set_bottom_page(5), self.run_diagnostics()))
         quality_row.addWidget(health_btn)
         traffic_layout.addLayout(quality_row)
@@ -437,8 +461,8 @@ class MainWindow(QMainWindow):
 
         profiles_tab = QWidget()
         profiles_layout = QVBoxLayout(profiles_tab)
-        profiles_layout.setContentsMargins(10, 10, 10, 10)
-        profiles_layout.setSpacing(8)
+        profiles_layout.setContentsMargins(4, 6, 4, 4)
+        profiles_layout.setSpacing(9)
 
         profiles_title = QLabel("Конфиги")
         profiles_title.setObjectName("sectionTitle")
@@ -465,17 +489,17 @@ class MainWindow(QMainWindow):
 
         self.profile_search_edit = QLineEdit()
         self.profile_search_edit.setObjectName("profileSearch")
-        self.profile_search_edit.setPlaceholderText("Search profiles")
+        self.profile_search_edit.setPlaceholderText("Поиск серверов")
         profile_tools.addWidget(self.profile_search_edit, 1)
 
         self.profile_sort_combo = QComboBox()
-        self.profile_sort_combo.addItem("Manual order", "manual")
-        self.profile_sort_combo.addItem("Name", "name")
-        self.profile_sort_combo.addItem("Latency", "latency")
-        self.profile_sort_combo.addItem("Location", "location")
-        self.profile_sort_combo.addItem("Recently used", "recent")
-        self.profile_sort_combo.addItem('Favorites first', 'favorites')
-        self.profile_sort_combo.addItem('Smart quality', 'quality')
+        self.profile_sort_combo.addItem("Мой порядок", "manual")
+        self.profile_sort_combo.addItem("Название", "name")
+        self.profile_sort_combo.addItem("Задержка", "latency")
+        self.profile_sort_combo.addItem("Страна", "location")
+        self.profile_sort_combo.addItem("Недавние", "recent")
+        self.profile_sort_combo.addItem('Избранные', 'favorites')
+        self.profile_sort_combo.addItem('Качество', 'quality')
         profile_tools.addWidget(self.profile_sort_combo)
         profiles_layout.addLayout(profile_tools)
 
@@ -485,10 +509,10 @@ class MainWindow(QMainWindow):
         self.profile_location_combo = QComboBox()
         self.profile_location_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.profile_location_combo.setMinimumContentsLength(14)
-        self.profile_location_combo.addItem("🌍 All locations", "ALL")
+        self.profile_location_combo.addItem("🌍 Все страны", "ALL")
         profile_filters.addWidget(self.profile_location_combo, 1)
 
-        self.ping_btn = QPushButton("⚡ Ping")
+        self.ping_btn = QPushButton("Проверить")
         self.ping_btn.setToolTip("Test latency of all profiles in parallel (Ctrl+P)")
         self.ping_btn.clicked.connect(self.refresh_latencies)
         profile_filters.addWidget(self.ping_btn)
@@ -731,59 +755,106 @@ class MainWindow(QMainWindow):
 
         applications_tab = QWidget()
         applications_layout = QVBoxLayout(applications_tab)
-        applications_layout.setContentsMargins(10, 10, 10, 10)
+        applications_layout.setContentsMargins(5, 6, 5, 4)
         applications_layout.setSpacing(10)
 
-        applications_title = QLabel("Applications")
-        applications_title.setObjectName("sectionTitle")
-        applications_layout.addWidget(applications_title)
+        title_row = QHBoxLayout()
+        applications_title = QLabel('Приложения')
+        applications_title.setObjectName('sectionTitle')
+        title_row.addWidget(applications_title)
+        title_row.addStretch(1)
+        back_to_vpn = QPushButton('На главную')
+        back_to_vpn.clicked.connect(lambda: self._set_bottom_page(0))
+        title_row.addWidget(back_to_vpn)
+        applications_layout.addLayout(title_row)
 
-        applications_hint = QLabel("App rules are applied before domain/IP rules. DNS uses the global DNS mode.")
-        applications_hint.setWordWrap(True)
-        applications_hint.setObjectName("softHint")
-        applications_layout.addWidget(applications_hint)
+        intro = QLabel('Какие программы должны использовать VPN?')
+        intro.setObjectName('softHint')
+        intro.setWordWrap(True)
+        applications_layout.addWidget(intro)
 
-        app_mode_label = QLabel("Mode")
-        app_mode_label.setObjectName("fieldLabel")
-        applications_layout.addWidget(app_mode_label)
-        self.app_mode_combo = QComboBox()
-        self.app_mode_combo.addItem("Off", "disabled")
-        self.app_mode_combo.addItem("Proxy selected apps", "proxy_selected")
-        self.app_mode_combo.addItem("Bypass selected apps", "direct_selected")
-        applications_layout.addWidget(self.app_mode_combo)
+        # Keep the QComboBox as the existing source of truth / persisted mode,
+        # but expose an unambiguous three-way control instead of a dropdown.
+        self.app_mode_combo = QComboBox(applications_tab)
+        self.app_mode_combo.addItem('Обычный режим', 'disabled')
+        self.app_mode_combo.addItem('Только выбранные', 'proxy_selected')
+        self.app_mode_combo.addItem('Все, кроме выбранных', 'direct_selected')
+        self.app_mode_combo.hide()
+        app_modes = QHBoxLayout()
+        app_modes.setSpacing(6)
+        self.app_mode_buttons: dict[str, QPushButton] = {}
+        for label, mode in [
+            ('Обычно', 'disabled'),
+            ('Только выбранные', 'proxy_selected'),
+            ('Кроме выбранных', 'direct_selected'),
+        ]:
+            button = QPushButton(label)
+            button.setObjectName('appModeBtn')
+            button.setCheckable(True)
+            button.setMinimumHeight(39)
+            button.clicked.connect(lambda _checked=False, key=mode: self._select_app_mode(key))
+            app_modes.addWidget(button, 1)
+            self.app_mode_buttons[mode] = button
+        applications_layout.addLayout(app_modes)
+        self.app_mode_explanation = QLabel('')
+        self.app_mode_explanation.setObjectName('appModeHint')
+        self.app_mode_explanation.setWordWrap(True)
+        self.app_mode_explanation.setMinimumHeight(34)
+        applications_layout.addWidget(self.app_mode_explanation)
 
+        list_header = QHBoxLayout()
+        list_header.setSpacing(8)
         self.app_search_edit = QLineEdit()
-        self.app_search_edit.setPlaceholderText("Search applications")
+        self.app_search_edit.setObjectName('appSearch')
+        self.app_search_edit.setPlaceholderText('Найти приложение…')
         self.app_search_edit.setClearButtonEnabled(True)
         self.app_search_edit.textChanged.connect(self._filter_application_list)
-        applications_layout.addWidget(self.app_search_edit)
-
-        app_tools = QHBoxLayout()
-        app_tools.setSpacing(8)
-        self.refresh_apps_btn = QPushButton("Refresh")
-        self.refresh_apps_btn.setToolTip("Refresh the list of running applications")
-        self.refresh_apps_btn.clicked.connect(self._refresh_application_list)
-        app_tools.addWidget(self.refresh_apps_btn)
-        self.add_app_btn = QPushButton("Add executable")
-        self.add_app_btn.setToolTip("Add an application that is not currently running")
-        self.add_app_btn.clicked.connect(self._add_application_executable)
-        app_tools.addWidget(self.add_app_btn)
-        self.app_selection_label = QLabel("No applications selected")
-        self.app_selection_label.setObjectName("softHint")
-        app_tools.addWidget(self.app_selection_label, 1)
-        applications_layout.addLayout(app_tools)
+        list_header.addWidget(self.app_search_edit, 1)
+        self.app_source_combo = QComboBox()
+        self.app_source_combo.addItem('Все', 'all')
+        self.app_source_combo.addItem('Запущенные', 'running')
+        self.app_source_combo.addItem('Выбранные', 'selected')
+        self.app_source_combo.currentIndexChanged.connect(self._filter_application_list)
+        self.app_source_combo.setMinimumContentsLength(11)
+        list_header.addWidget(self.app_source_combo)
+        applications_layout.addLayout(list_header)
 
         self.application_list = QListWidget()
-        self.application_list.setObjectName("applications")
+        self.application_list.setObjectName('applications')
         self.application_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.application_list.setIconSize(QSize(30, 30))
         self.application_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.application_list.setWordWrap(True)
+        self.application_list.setWordWrap(False)
+        self.application_list.setAlternatingRowColors(False)
         applications_layout.addWidget(self.application_list, 1)
 
-        applications_footer = QLabel("Select a running app or add its executable manually. The path is shown in the tooltip.")
-        applications_footer.setWordWrap(True)
-        applications_footer.setObjectName("softHint")
-        applications_layout.addWidget(applications_footer)
+        tools = QHBoxLayout()
+        tools.setSpacing(7)
+        self.app_selection_label = QLabel('Не выбрано')
+        self.app_selection_label.setObjectName('softHint')
+        tools.addWidget(self.app_selection_label, 1)
+        self.refresh_apps_btn = QPushButton('Обновить список')
+        self.refresh_apps_btn.clicked.connect(self._rescan_application_catalog)
+        tools.addWidget(self.refresh_apps_btn)
+        self.add_app_btn = QPushButton('+ Файл')
+        self.add_app_btn.setToolTip('Добавить программу по пути к исполняемому файлу')
+        self.add_app_btn.clicked.connect(self._add_application_executable)
+        tools.addWidget(self.add_app_btn)
+        applications_layout.addLayout(tools)
+
+        hint_card = QFrame()
+        hint_card.setObjectName('appNotice')
+        hint_layout = QVBoxLayout(hint_card)
+        hint_layout.setContentsMargins(11, 9, 11, 9)
+        self.app_warning = QLabel(
+            'Linux определяет приложения по исполняемому файлу. Для Flatpak и '
+            'программ с отдельными сетевыми процессами сначала запустите программу '
+            'и нажмите «Обновить список». DNS системы общий; это не Kill Switch.')
+        self.app_warning.setObjectName('softHint')
+        self.app_warning.setWordWrap(True)
+        hint_layout.addWidget(self.app_warning)
+        applications_layout.addWidget(hint_card)
+
         self._refresh_application_list()
         self.content_stack.addWidget(applications_tab)
 
@@ -858,8 +929,8 @@ class MainWindow(QMainWindow):
         bottom_nav.setObjectName("bottomNav")
         self.bottom_nav = bottom_nav
         nav_layout = QHBoxLayout(bottom_nav)
-        nav_layout.setContentsMargins(0, 0, 0, 0)
-        nav_layout.setSpacing(5)
+        nav_layout.setContentsMargins(5, 5, 5, 5)
+        nav_layout.setSpacing(3)
         self.nav_buttons: list[QPushButton] = []
         self._mobile_pages = [0, 1, 6]
         for index, label in enumerate(["VPN", "Конфиги", "Подписки"]):
@@ -869,7 +940,7 @@ class MainWindow(QMainWindow):
             btn.clicked.connect(lambda _checked=False, i=index: self._set_bottom_page(self._mobile_pages[i]))
             nav_layout.addWidget(btn, 1)
             self.nav_buttons.append(btn)
-        self.more_btn = QPushButton("Ещё ▾")
+        self.more_btn = QPushButton("Ещё")
         self.more_btn.setObjectName("navBtn")
         self.more_btn.setToolTip("Маршруты, приложения, диагностика и логи")
         more_menu = QMenu(self.more_btn)
@@ -890,313 +961,9 @@ class MainWindow(QMainWindow):
         fastest_shortcut.setContext(Qt.ApplicationShortcut)
         fastest_shortcut.activated.connect(self._connect_fastest)
 
-        self.statusBar().showMessage('Disconnected')
+        self.statusBar().hide()  # status lives in the dashboard; no redundant bottom bar
 
-        self.setStyleSheet(
-            """
-            QMainWindow {
-              background-color: #0f1119;
-            }
-            QWidget {
-              color: #d9dce3;
-              font-family: "Noto Sans", "Segoe UI", sans-serif;
-              font-size: 13px;
-            }
-            QWidget#root {
-              background: qradialgradient(cx:0.5, cy:0.04, radius:1.2,
-                fx:0.5, fy:0.04, stop:0 #1b1e28, stop:0.42 #11141d, stop:1 #090b11);
-            }
-            QFrame#phoneShell {
-              background-color: #0f1119;
-              border: none;
-              border-radius: 0px;
-            }
-            QFrame#headerCard {
-              background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                stop:0 #171b26, stop:1 #131722);
-              border: 1px solid #2d3340;
-              border-radius: 12px;
-            }
-            QFrame#warningCard {
-              background-color: #2d241f;
-              border: 1px solid #664f41;
-              border-radius: 12px;
-            }
-            #panelTitle {
-              font-size: 16px;
-              font-weight: 700;
-              color: #f0f1f5;
-            }
-            #subtitle, #softHint, #hint {
-              color: #8f95a3;
-            }
-            #sectionTitle {
-              font-size: 14px;
-              font-weight: 700;
-              color: #eceef2;
-            }
-            #fieldLabel {
-              color: #cbcfd8;
-              font-weight: 600;
-              margin-bottom: 2px;
-            }
-            #quickProfileTitle {
-              color: #f0c998;
-              font-weight: 700;
-              font-size: 13px;
-            }
-            QPushButton {
-              background-color: #1c202b;
-              border: 1px solid #3a3f4d;
-              border-radius: 10px;
-              padding: 8px 11px;
-              font-weight: 600;
-            }
-            QPushButton:hover {
-              background-color: #252a36;
-              border: 1px solid #4a5161;
-            }
-            QPushButton:pressed {
-              background-color: #181c26;
-            }
-            #connectBtn {
-              background: qradialgradient(cx:0.5, cy:0.5, radius:0.8,
-                fx:0.5, fy:0.5, stop:0 #121620, stop:1 #0c1018);
-              border: 2px solid #f0f2f6;
-              border-radius: 80px;
-              font-size: 26px;
-              font-weight: 700;
-              color: #f4f6fa;
-              padding: 0;
-            }
-            QFrame#statusCard {
-              background-color: #111621;
-              border: 1px solid #2c3341;
-              border-radius: 10px;
-            }
-            #statusLabel {
-              font-size: 14px;
-              font-weight: 700;
-              color: #eceef2;
-            }
-            #statusDot {
-              font-size: 16px;
-              color: #6b7280;
-            }
-            #emptyState {
-              color: #8f95a3;
-              padding: 8px;
-            }
-            #connectBtn:hover {
-              border: 2px solid #f3b66a;
-              color: #f3b66a;
-            }
-            #connectBtn[vpnState="connected"] {
-              border: 2px solid #f3b66a;
-              color: #f3b66a;
-            }
-            #connectBtn[vpnState="connected"]:hover {
-              border: 2px solid #ffcc8e;
-              color: #ffcc8e;
-            }
-            #installBtn {
-              background-color: #3a2a23;
-              border: 1px solid #6a4f43;
-              color: #ffe3c9;
-            }
-            #installBtn:hover {
-              background-color: #4a3329;
-            }
-            #warn {
-              color: #ffcfad;
-              font-weight: 700;
-            }
-            QCheckBox {
-              color: #d9dce3;
-            }
-            QCheckBox::indicator {
-              width: 18px;
-              height: 18px;
-            }
-            QCheckBox::indicator:unchecked {
-              border: 1px solid #535a68;
-              background: #10151f;
-              border-radius: 4px;
-            }
-            QCheckBox::indicator:checked {
-              border: 1px solid #e0a85f;
-              background: #d78f3a;
-              border-radius: 4px;
-            }
-            QComboBox, QLineEdit, QSpinBox, #domains {
-              border: 1px solid #3d4453;
-              border-radius: 8px;
-              padding: 6px 8px;
-              background: #0f141f;
-              color: #e0e4ec;
-            }
-            QComboBox QAbstractItemView {
-              background: #131825;
-              border: 1px solid #323a49;
-              selection-background-color: #3a3027;
-            }
-            QScrollArea {
-              background-color: #0f1119;
-              border: none;
-            }
-            QScrollArea#settingsScroll > QWidget#qt_scrollarea_viewport,
-            QScrollArea#settingsScroll QWidget#settingsBody {
-              background-color: #0f1119;
-            }
-            QListWidget#applications {
-              border: 1px solid #333948;
-              border-radius: 11px;
-              background-color: #101520;
-              outline: none;
-              color: #d6dbe4;
-            }
-            QListWidget#applications::item {
-              min-height: 28px;
-              padding: 5px 6px;
-              border-bottom: 1px solid #232938;
-            }
-            QListWidget#applications::item:hover {
-              background-color: #171e2b;
-            }
-            QListWidget#applications::indicator {
-              width: 17px;
-              height: 17px;
-            }
-            QWidget:disabled {
-              color: #757d8c;
-            }
-            QFrame#subCard {
-              background-color: #111621;
-              border: 1px solid #2c3341;
-              border-radius: 10px;
-            }
-            QFrame#quickProfileCard {
-              background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                stop:0 #171420, stop:1 #131822);
-              border: 1px solid #5c4735;
-              border-radius: 10px;
-            }
-            QComboBox#quickProfileCombo {
-              border: 1px solid #7c5a3f;
-              background: #15111a;
-              color: #f4d4a8;
-              font-weight: 700;
-              min-height: 36px;
-              padding-right: 24px;
-            }
-            QComboBox#quickProfileCombo:hover {
-              border: 1px solid #a7774c;
-              color: #ffd9a5;
-            }
-            #profiles {
-              border: 1px solid #333948;
-              border-radius: 11px;
-              background-color: #101520;
-              outline: none;
-            }
-            #profiles::item {
-              padding: 9px;
-              border-bottom: 1px solid #232938;
-            }
-            #profiles::item:selected {
-              background: #2f2720;
-              border: 1px solid #a7763f;
-              border-radius: 8px;
-              color: #f0b774;
-            }
-            #logs {
-              background-color: #0d111a;
-              border: 1px solid #323a49;
-              border-radius: 10px;
-              font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
-              color: #d6dbe4;
-            }
-            QFrame#bottomNav {
-              background: transparent;
-              border: none;
-            }
-            QPushButton#navBtn {
-              border: 1px solid #2f3645;
-              border-radius: 10px;
-              background: #131823;
-              color: #9ca3b2;
-              min-height: 44px;
-              font-size: 13px;
-              font-weight: 600;
-              padding: 6px 8px;
-            }
-            QPushButton#navBtn:hover {
-              background: #171d2a;
-              border: 1px solid #445065;
-              color: #c9d2e0;
-            }
-            QPushButton#navBtn:checked {
-              background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                stop:0 #3b2f22, stop:1 #2f241a);
-              border: 1px solid #b9834b;
-              color: #f0b774;
-            }
-            QFrame#sideNav {
-              background-color: #101b28;
-              border: 1px solid #293747;
-              border-radius: 17px;
-            }
-            QLabel#sideBrand { font-size: 20px; font-weight: 800; color: #eff9ff; }
-            QPushButton#sideNavBtn {
-              background: transparent;
-              border: 1px solid transparent;
-              color: #aabac9;
-              text-align: left;
-              font-size: 13px;
-              padding: 11px 15px;
-            }
-            QPushButton#sideNavBtn:hover { background-color: #1c3042; }
-            QPushButton#sideNavBtn:checked {
-              background-color: #173f48;
-              border: 1px solid #317f84;
-              color: #9ef3dc;
-            }
-            QFrame#metricCard {
-              background-color: #111b27;
-              border: 1px solid #2b3b4b;
-              border-radius: 13px;
-            }
-            QLabel#trafficRate { color: #83e6c8; font-weight: 700; }
-            QLabel#diagnosticSummary {
-              color: #c8f5e3;
-              background-color: #16313b;
-              border: 1px solid #2a5b64;
-              border-radius: 11px;
-              padding: 15px;
-              font-weight: 600;
-            }
-            QFrame#phoneShell { background: #101722; border-radius: 17px; }
-            QMainWindow { background-color: #0b111a; }
-            QWidget#root { background: #0b111a; }
-            #connectBtn { border-color: #65d9bb; color: #f1fff9; border-radius: 20px; font-size: 20px; }
-            QPushButton#sourceTab { border-radius: 9px; color: #9aaabd; }
-            QPushButton#sourceTab:checked { background-color: #214e58; border-color: #4fb5a8; color: #e8fff5; }
-            QPushButton#primaryAction { background-color: #245c61; border: 1px solid #39988e; color: #e8fff5; }
-            QPushButton#primaryAction:hover { background-color: #287276; }
-            QFrame#subscriptionCard { background-color: #182331; border: 1px solid #2b4050; border-radius: 12px; }
-            QLabel#subscriptionName { font-size: 13px; font-weight: 700; color: #eff7ff; }
-            QProgressBar#subscriptionProgress { background-color: #273643; border: none; border-radius: 2px; }
-            QProgressBar#subscriptionProgress::chunk { background-color: #5dc9a4; border-radius: 2px; }
-            QPushButton#navBtn[active="true"] { background-color: #17414b; border-color: #48b4ae; color: #a0f5df; }
-            #connectBtn:hover { border-color: #9cfad9; color: #9cfad9; }
-            #connectBtn[vpnState="connected"] { border-color: #5ed0ae; color: #7bf4c9; }
-            QPushButton#navBtn:checked {
-              background-color: #17414b;
-              border-color: #48b4ae;
-              color: #a0f5df;
-            }
-            """
-        )
+        self.setStyleSheet(STYLESHEET)
 
     def _setup_notifications(self) -> None:
         self.tray_icon: QSystemTrayIcon | None = None
@@ -1232,13 +999,13 @@ class MainWindow(QMainWindow):
         painter.setBrush(QColor("#111621"))
         painter.drawRoundedRect(4, 4, 56, 56, 16, 16)
 
-        painter.setBrush(QColor("#f0b774"))
+        painter.setBrush(QColor("#31c9ae"))
         painter.drawRoundedRect(10, 10, 44, 44, 14, 14)
 
         painter.setBrush(QColor("#171b26"))
         painter.drawEllipse(18, 18, 28, 28)
 
-        pen = QPen(QColor("#fff3de"))
+        pen = QPen(QColor("#e6fffa"))
         pen.setWidth(3)
         painter.setPen(pen)
         painter.drawArc(17, 17, 30, 30, 35 * 16, 240 * 16)
@@ -2008,7 +1775,7 @@ class MainWindow(QMainWindow):
         self.dns_mode_combo.setCurrentIndex(dns_mode_index)
         self.custom_dns_edit.setText(route_custom_dns)
         app_mode_index = self.app_mode_combo.findData(app_mode)
-        if app_mode_index < 0:
+        if app_mode_index < 0 or (app_mode != 'disabled' and not self._selected_application_rules()):
             app_mode_index = 0
         self.app_mode_combo.setCurrentIndex(app_mode_index)
         self.include_subdomains_checkbox.setChecked(include_subdomains)
@@ -2175,6 +1942,9 @@ class MainWindow(QMainWindow):
         if self.vpn.status not in {"connected", "connecting"}:
             return
         routing = self._routing_options()
+        if routing.app_mode != 'disabled' and not (routing.app_process_names or routing.app_process_paths):
+            self._append_log('Choose at least one app before applying application routing.')
+            return
         if routing.dns_mode == "custom" and routing.custom_dns.strip():
             try:
                 # Reject malformed in-progress edits before stopping a healthy
@@ -2217,130 +1987,190 @@ class MainWindow(QMainWindow):
         return result
 
     def _discover_running_applications(self) -> list[dict[str, str]]:
-        """Return distinct executable identities visible through /proc.
+        """Compatibility shim for running process discovery; no Qt required."""
+        return [{'name': app.process_name, 'path': app.path} for app in running_applications()]
 
-        Process rules are evaluated by sing-box against the executable that
-        owns a socket.  We keep both comm (process name) and /proc/<pid>/exe
-        so the UI can still work when an application is not running at connect
-        time and can distinguish two programs with the same short name.
-        """
-        if os.name != "posix":
-            return []
-        found: dict[tuple[str, str], dict[str, str]] = {}
-        try:
-            pids = os.listdir("/proc")
-        except OSError:
-            return []
-        for pid in pids:
-            if not pid.isdigit() or int(pid) == os.getpid():
-                continue
-            try:
-                name = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8").strip()
-                path = os.readlink(f"/proc/{pid}/exe")
-            except (OSError, UnicodeError):
-                continue
-            if not name or not path or path.startswith("["):
-                continue
-            key = (name, path)
-            found[key] = {"name": name, "path": path}
-        return sorted(found.values(), key=lambda item: (item["name"].lower(), item["path"]))
+    def _rescan_application_catalog(self) -> None:
+        self._installed_apps = None
+        self._refresh_application_list()
+
+    def _icon_for_application(self, app: DesktopApp) -> QIcon:
+        key = app.icon or app.path
+        cached = self._desktop_icons.get(key)
+        if cached is not None:
+            return cached
+        icon = QIcon()
+        if app.icon:
+            if os.path.isabs(app.icon):
+                icon = QIcon(app.icon)
+            else:
+                icon = QIcon.fromTheme(app.icon)
+        if icon.isNull() and app.path:
+            # QFileIconProvider respects desktop environment mappings; on Linux
+            # Qt's icon theme resolves names from freedesktop .desktop entries.
+            icon = QFileIconProvider().icon(QFileInfo(app.path))
+        if icon.isNull():
+            icon = QIcon.fromTheme('application-x-executable')
+        if icon.isNull():
+            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+        self._desktop_icons[key] = icon
+        return icon
 
     def _refresh_application_list(self) -> None:
         saved = self._read_saved_application_rules()
-        current = self._discover_running_applications()
-        merged: dict[tuple[str, str], dict[str, str]] = {}
-        for item in [*saved, *current]:
-            key = (item.get("name", ""), item.get("path", ""))
-            if key[0] or key[1]:
-                merged[key] = {"name": key[0], "path": key[1]}
+        if self._installed_apps is None:
+            self._installed_apps = installed_applications()
+        running = running_applications()
+        merged = merge_applications(self._installed_apps, running, saved)
+        saved_keys = {identity(item['name'], item['path']) for item in saved}
 
-        saved_keys = {(item["name"], item["path"]) for item in saved}
+        # Show the applications people recognize, not 200 mostly-system /proc
+        # entries. 'Запущенные' still exposes raw processes when needed.
+        merged.sort(key=lambda app: (identity(app.process_name, app.path) not in saved_keys,
+                                     app.source == 'running', app.name.casefold()))
         self.application_list.blockSignals(True)
         self.application_list.clear()
-        for item in sorted(merged.values(), key=lambda value: (value["name"].lower(), value["path"])):
-            key = (item["name"], item["path"])
-            running = key not in saved_keys or key in {(x["name"], x["path"]) for x in current}
-            label = item["name"] or Path(item["path"]).name or item["path"]
-            if not running:
-                label += "  (not running)"
-            widget_item = QListWidgetItem(label)
-            widget_item.setFlags(widget_item.flags() | Qt.ItemIsUserCheckable)
-            widget_item.setCheckState(Qt.Checked if key in saved_keys else Qt.Unchecked)
-            widget_item.setData(Qt.UserRole, item)
-            if item["path"]:
-                widget_item.setToolTip(item["path"])
-            self.application_list.addItem(widget_item)
+        for app in merged:
+            key = identity(app.process_name, app.path)
+            label = app.name
+            if app.running and app.source != 'running':
+                label += '  ·  запущено'
+            row = QListWidgetItem(self._icon_for_application(app), label)
+            row.setSizeHint(QSize(0, 48))
+            row.setFlags(row.flags() | Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            row.setCheckState(Qt.Checked if key in saved_keys else Qt.Unchecked)
+            row.setData(Qt.UserRole, app.rule())
+            row.setData(Qt.UserRole + 1, {
+                'source': app.source, 'running': app.running,
+                'display': app.name, 'path': app.path,
+            })
+            row.setToolTip(f'{app.name}\n{app.path or app.process_name}\n'
+                           + ('Запущено' if app.running else 'Не запущено'))
+            self.application_list.addItem(row)
         self.application_list.blockSignals(False)
-        self._filter_application_list(self.app_search_edit.text())
+        self._filter_application_list()
         self._update_application_selection_label()
 
-    def _filter_application_list(self, text: str = "") -> None:
-        query = text.strip().casefold()
+    def _filter_application_list(self, _text: str = '') -> None:
+        query = self.app_search_edit.text().strip().casefold()
+        source = self.app_source_combo.currentData() or 'all'
         for index in range(self.application_list.count()):
             item = self.application_list.item(index)
-            data = item.data(Qt.UserRole)
-            name = str(data.get("name") or "") if isinstance(data, dict) else ""
-            path = str(data.get("path") or "") if isinstance(data, dict) else ""
-            item.setHidden(bool(query) and query not in f"{name} {path}".casefold())
+            data = item.data(Qt.UserRole) or {}
+            meta = item.data(Qt.UserRole + 1) or {}
+            selected = item.checkState() == Qt.Checked
+            name = str(meta.get('display') or data.get('name') or '')
+            path = str(data.get('path') or '')
+            matches = not query or query in f'{name} {path} {data.get("name", "")}'.casefold()
+            if source == 'selected':
+                visible = selected
+            elif source == 'running':
+                visible = bool(meta.get('running')) or selected
+            else:
+                visible = meta.get('source') != 'running' or selected
+            item.setHidden(not (matches and visible))
 
     def _add_application_executable(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Select application executable", "/usr/bin")
+        path, _ = QFileDialog.getOpenFileName(self, 'Выберите исполняемый файл', '/usr/bin')
         if not path:
             return
         executable = Path(path)
         if not executable.is_file() or not os.access(path, os.X_OK):
-            self._show_error("Selected file is not an executable.")
+            self._show_error('Выбранный файл не является исполняемым.')
             return
         try:
             executable = executable.resolve()
         except OSError:
             pass
         saved = self._read_saved_application_rules()
-        entry = {"name": executable.name, "path": str(executable)}
-        if entry not in saved:
-            saved.append(entry)
-            self.settings.setValue("route_applications", json.dumps(saved, ensure_ascii=False))
+        item = {'name': '', 'path': str(executable)}
+        if not any(identity(x.get('name', ''), x.get('path', '')) == identity('', item['path'])
+                   for x in saved):
+            saved.append(item)
+            self.settings.setValue('route_applications', json.dumps(saved, ensure_ascii=False))
         self._refresh_application_list()
-        for index in range(self.application_list.count()):
-            item = self.application_list.item(index)
-            if item.data(Qt.UserRole) == entry:
-                item.setCheckState(Qt.Checked)
-                break
+        if self.app_mode_combo.currentData() == 'disabled':
+            self._select_app_mode('proxy_selected')
+        self._schedule_live_routing_apply()
 
     def _selected_application_rules(self) -> list[dict[str, str]]:
         selected: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
         for index in range(self.application_list.count()):
             item = self.application_list.item(index)
             if item.checkState() != Qt.Checked:
                 continue
             data = item.data(Qt.UserRole)
             if isinstance(data, dict):
-                selected.append({"name": str(data.get("name") or ""), "path": str(data.get("path") or "")})
+                name, path = str(data.get('name') or ''), str(data.get('path') or '')
+                key = identity(name, path)
+                if key not in seen:
+                    seen.add(key)
+                    selected.append({'name': name if not path else '', 'path': path})
         return selected
 
     def _save_selected_application_rules(self) -> None:
-        self.settings.setValue("route_applications", json.dumps(self._selected_application_rules(), ensure_ascii=False))
+        self.settings.setValue('route_applications', json.dumps(self._selected_application_rules(), ensure_ascii=False))
         self._update_application_selection_label()
+        self._filter_application_list()
 
-    def _on_application_item_changed(self, _item: QListWidgetItem) -> None:
+    def _select_app_mode(self, mode: str) -> None:
+        if mode != 'disabled' and not self._selected_application_rules():
+            self.app_search_edit.setFocus()
+            self.app_mode_explanation.setText('Сначала отметьте нужные программы в списке ниже.')
+            return
+        index = self.app_mode_combo.findData(mode)
+        if index >= 0:
+            self.app_mode_combo.setCurrentIndex(index)
+
+    def _on_application_item_changed(self, item: QListWidgetItem) -> None:
         self._save_selected_application_rules()
+        count = len(self._selected_application_rules())
+        if item.checkState() == Qt.Checked and self.app_mode_combo.currentData() == 'disabled':
+            self._select_app_mode('proxy_selected')
+        elif count == 0 and self.app_mode_combo.currentData() != 'disabled':
+            self._select_app_mode('disabled')
+        self._update_application_controls()
         self._schedule_live_routing_apply()
 
     def _update_application_selection_label(self) -> None:
-        count = len(self._selected_application_rules()) if hasattr(self, "application_list") else 0
-        self.app_selection_label.setText(f"{count} selected")
+        count = len(self._selected_application_rules()) if hasattr(self, 'application_list') else 0
+        self.app_selection_label.setText(f'Выбрано: {count}' if count else 'Не выбрано')
+        self._update_app_quick_action()
+
+    def _update_app_quick_action(self) -> None:
+        if not hasattr(self, 'app_quick_btn'):
+            return
+        count = len(self._selected_application_rules()) if hasattr(self, 'application_list') else 0
+        mode = self.app_mode_combo.currentData()
+        if mode == 'proxy_selected':
+            label = f'Только выбранные приложения: {count}'
+        elif mode == 'direct_selected':
+            label = f'VPN для всех, кроме {count} приложений'
+        else:
+            label = 'Маршрутизация приложений  ·  Настроить'
+        self.app_quick_btn.setText(label)
 
     def _update_application_controls(self) -> None:
-        enabled = self.app_mode_combo.currentData() != "disabled"
-        self.application_list.setEnabled(enabled)
-        self.refresh_apps_btn.setEnabled(True)
-        self.add_app_btn.setEnabled(True)
-        if enabled:
-            self.app_selection_label.setToolTip(
-                "Selected application rules have priority over domain/IP rules."
-            )
+        mode = self.app_mode_combo.currentData()
+        count = len(self._selected_application_rules())
+        for key, button in self.app_mode_buttons.items():
+            button.setChecked(key == mode)
+            button.setEnabled(key == 'disabled' or count > 0)
+        if mode == 'proxy_selected':
+            explanation = (f'Через VPN идут только отмеченные программы ({count}). '
+                           'Весь остальной трафик — напрямую. DNS системы остаётся общим.')
+        elif mode == 'direct_selected':
+            explanation = (f'Отмеченные программы ({count}) обходят VPN. '
+                           'Остальные используют VPN. DNS системы остаётся общим.')
         else:
-            self.app_selection_label.setToolTip("Application routing is disabled.")
+            explanation = ('Обычный режим: используются правила маршрутизации из настроек. '
+                           'Отметьте программу, чтобы включить режим «Только выбранные».')
+        if mode != 'disabled' and count == 0:
+            explanation = 'Выберите хотя бы одно приложение. Пока ничего не выбрано, изменение VPN не применяется.'
+        self.app_mode_explanation.setText(explanation)
+        self.application_list.setEnabled(True)
+        self._update_app_quick_action()
 
     def _update_routing_controls(self) -> None:
         needs_domains = self.route_mode_combo.currentData() in {"only_selected", "all_except_selected"}
@@ -3152,12 +2982,10 @@ class MainWindow(QMainWindow):
             domains=domains,
             ip_cidrs=ip_cidrs,
             app_mode=str(self.app_mode_combo.currentData() or "disabled"),
-            app_process_names=sorted(
-                {item["name"] for item in self._selected_application_rules() if item.get("name")}
-            ),
-            app_process_paths=sorted(
-                {item["path"] for item in self._selected_application_rules() if item.get("path")}
-            ),
+            app_process_names=sorted({item['name'] for item in self._selected_application_rules()
+                                      if item.get('name') and not item.get('path')}),
+            app_process_paths=sorted({item['path'] for item in self._selected_application_rules()
+                                      if item.get('path')}),
         )
 
     def _on_profile_filter_changed(self) -> None:
@@ -3486,10 +3314,10 @@ class MainWindow(QMainWindow):
 
     def _set_status(self, status: str) -> None:
         mapping = {
-            "disconnected": ("Disconnected", "statusDisconnected", "Connect"),
-            "connecting": ("Connecting...", "statusConnecting", "Stop"),
-            "connected": ("Connected", "statusConnected", "Stop"),
-            "disconnecting": ("Disconnecting...", "statusDisconnecting", "Stop"),
+            "disconnected": ("Не подключено", "statusDisconnected", "Подключить"),
+            "connecting": ("Подключаемся…", "statusConnecting", "Отменить"),
+            "connected": ("Защищённое соединение", "statusConnected", "Отключить"),
+            "disconnecting": ("Отключаемся…", "statusDisconnecting", "Отключить"),
         }
         status_text, _, button_text = mapping.get(status, (status, "statusDisconnected", "Connect"))
         self.connect_btn.setText(button_text)
@@ -3499,7 +3327,7 @@ class MainWindow(QMainWindow):
         dot_colors = {
             "disconnected": "#6b7280",
             "connecting": "#e0a34e",
-            "connected": "#4a9e6a",
+            "connected": "#4bd3b2",
             "disconnecting": "#e0a34e",
         }
         self.status_dot.setStyleSheet(f"color: {dot_colors.get(status, '#6b7280')}; font-size: 16px;")
@@ -3509,7 +3337,7 @@ class MainWindow(QMainWindow):
 
     def _update_vpn_profile_label(self) -> None:
         if not self.profiles:
-            self.vpn_profile_label.setText("No profiles yet")
+            self.vpn_profile_label.setText("Добавьте подписку или конфиг")
             return
         if self.vpn.status in {"connected", "connecting"} and self.connected_index is not None:
             index = self.connected_index
