@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
 from app.app_paths import ensure_user_owned, import_configs_dir, log_path, profiles_path, settings_path
 from app.security import atomic_private_json, redact, redacted_structure
 from app.quality import QualityTracker, should_switch
+from app.profile_sources import profile_indices_for_source
 from app.diagnostics import connected_diagnostics
 from app.route_presets import PRESETS, preset_values
 from app.dashboard import TrafficChart
@@ -76,7 +77,7 @@ from app.subscriptions import (
     is_likely_subscription_url,
     subscription_due,
 )
-from app.subscriptions_dialog import SubscriptionsDialog
+from app.subscriptions_dialog import AddSubscriptionDialog, SubscriptionsPanel
 from app.net_session import IFACE_NAME
 from app.single_instance import LINK_PREFIX, SERVER_NAME
 from app.vpn_manager import VpnManager
@@ -86,12 +87,10 @@ class ProfileListWidget(QListWidget):
     files_dropped = Signal(list)
     links_dropped = Signal(list)
     items_reordered = Signal(int, int)
-    item_left_clicked = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._drag_row: int | None = None
-        self._press_info: tuple | None = None
         self.setAcceptDrops(True)
         self.setDragEnabled(True)
         self.setDropIndicatorShown(True)
@@ -102,22 +101,6 @@ class ProfileListWidget(QListWidget):
     def startDrag(self, supported_actions) -> None:  # type: ignore[override]
         self._drag_row = self.currentRow()
         super().startDrag(supported_actions)
-
-    def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        if event.button() == Qt.LeftButton:
-            self._press_info = (self.itemAt(event.pos()), event.pos().x(), event.pos().y())
-        super().mousePressEvent(event)
-
-    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
-        super().mouseReleaseEvent(event)
-        info, self._press_info = self._press_info, None
-        if event.button() != Qt.LeftButton or info is None:
-            return
-        press_item, px, py = info
-        item = self.itemAt(event.pos())
-        moved = abs(event.pos().x() - px) + abs(event.pos().y() - py)
-        if item is not None and item is press_item and moved < 8:
-            self.item_left_clicked.emit(item)
 
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]
         if event.mimeData().hasUrls():
@@ -172,8 +155,8 @@ class MainWindow(QMainWindow):
     def __init__(self, initial_link: str | None = None) -> None:
         super().__init__()
         self.setWindowTitle("ambox")
-        self.resize(1040, 740)
-        self.setMinimumSize(360, 600)
+        self.resize(520, 710)
+        self.setMinimumSize(370, 540)
         self._app_icon = self._build_app_icon()
         self.setWindowIcon(self._app_icon)
 
@@ -217,6 +200,7 @@ class MainWindow(QMainWindow):
         self._reconnect_timer.timeout.connect(self._attempt_reconnect)
         self._subs_inflight: set[str] = set()
         self._subs_silent: set[str] = set()
+        self._pending_subscription_links: dict[str, str] = {}
         self._subscription_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='ambox-sub')
         self._subscription_retry_at: dict[str, float] = {}
         self._subscription_failures: dict[str, int] = {}
@@ -225,10 +209,8 @@ class MainWindow(QMainWindow):
 
         self.subscription_store = SubscriptionStore()
         self._selected_location = "ALL"
+        self._profile_source = "manual"
         self._selected_sub_id = ""
-        self._expanded_sub_ids: set[str] = set()
-        self._last_header_toggle = 0.0
-        self._subs_dialog: SubscriptionsDialog | None = None
 
         self.vpn = VpnManager()
         self.settings = QSettings(str(settings_path()), QSettings.IniFormat)
@@ -289,49 +271,15 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         root.setAcceptDrops(True)
 
-        main = QHBoxLayout(root)
-        main.setContentsMargins(14, 14, 14, 14)
-        main.setSpacing(14)
-
-        self.side_nav = QFrame()
-        self.side_nav.setObjectName('sideNav')
-        self.side_nav.setFixedWidth(195)
-        side_layout = QVBoxLayout(self.side_nav)
-        side_layout.setContentsMargins(12, 18, 12, 14)
-        side_layout.setSpacing(7)
-        brand = QLabel('◈  AMBOX')
-        brand.setObjectName('sideBrand')
-        side_layout.addWidget(brand)
-        side_hint = QLabel('Private network workspace')
-        side_hint.setObjectName('softHint')
-        side_hint.setWordWrap(True)
-        side_layout.addWidget(side_hint)
-        side_layout.addSpacing(20)
-        self.side_nav_buttons: dict[int, QPushButton] = {}
-        for label, page in [('⌂  Overview', 0), ('▤  Servers', 1),
-                            ('◇  Routing', 2), ('▦  Applications', 3),
-                            ('◉  Diagnostics', 5), ('≡  Logs', 4)]:
-            button = QPushButton(label)
-            button.setObjectName('sideNavBtn')
-            button.setCheckable(True)
-            button.setCursor(Qt.PointingHandCursor)
-            button.clicked.connect(lambda _checked=False, i=page: self._set_bottom_page(i))
-            button.setMinimumHeight(43)
-            side_layout.addWidget(button)
-            self.side_nav_buttons[page] = button
-        side_layout.addStretch(1)
-        side_info = QLabel('Powered by sing-box\nLocal-first • Open configuration')
-        side_info.setObjectName('softHint')
-        side_info.setWordWrap(True)
-        side_layout.addWidget(side_info)
-        main.addWidget(self.side_nav)
+        main = QVBoxLayout(root)
+        main.setContentsMargins(8, 8, 8, 8)
+        main.setSpacing(6)
 
         phone_shell = QFrame()
         phone_shell.setObjectName("phoneShell")
-        phone_shell.setMaximumWidth(1280)
         phone_layout = QVBoxLayout(phone_shell)
-        phone_layout.setContentsMargins(10, 10, 10, 10)
-        phone_layout.setSpacing(10)
+        phone_layout.setContentsMargins(6, 6, 6, 6)
+        phone_layout.setSpacing(7)
 
         header = QFrame()
         header.setObjectName("headerCard")
@@ -339,14 +287,9 @@ class MainWindow(QMainWindow):
         header_layout.setContentsMargins(12, 10, 12, 10)
         header_layout.setSpacing(6)
 
-        title = QLabel('ambox  /  network control')
+        title = QLabel('ambox')
         title.setObjectName('panelTitle')
         header_layout.addWidget(title, 0, Qt.AlignLeft)
-
-        subtitle = QLabel('Reliable connection • clear diagnostics • private by design')
-        subtitle.setObjectName('subtitle')
-        subtitle.setWordWrap(True)
-        header_layout.addWidget(subtitle, 0, Qt.AlignLeft)
 
         phone_layout.addWidget(header)
 
@@ -382,11 +325,11 @@ class MainWindow(QMainWindow):
         vpn_status_layout.addLayout(vpn_status_text, 1)
         connect_layout.addWidget(self.vpn_status_card)
 
-        connect_layout.addStretch(1)
+        connect_layout.addSpacing(8)
 
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.setObjectName("connectBtn")
-        self.connect_btn.setFixedSize(160, 160)
+        self.connect_btn.setFixedSize(140, 100)
         self.connect_btn.setProperty("vpnState", "disconnected")
         self.connect_btn.clicked.connect(self.toggle_connection)
         connect_layout.addWidget(self.connect_btn, 0, Qt.AlignHCenter)
@@ -431,7 +374,7 @@ class MainWindow(QMainWindow):
         self.vpn_empty_frame.setVisible(False)
         connect_layout.addWidget(self.vpn_empty_frame)
 
-        connect_layout.addStretch(1)
+        connect_layout.addSpacing(8)
 
         self.quick_profile_frame = QFrame()
         self.quick_profile_frame.setObjectName("quickProfileCard")
@@ -448,10 +391,6 @@ class MainWindow(QMainWindow):
         self.quick_profile_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.quick_profile_combo.setMinimumContentsLength(14)
         quick_profile_layout.addWidget(self.quick_profile_combo)
-
-        quick_profile_hint = QLabel("Switch profile directly from VPN tab.")
-        quick_profile_hint.setObjectName("softHint")
-        quick_profile_layout.addWidget(quick_profile_hint)
 
         self.quick_profile_latency_label = QLabel("Latency update: never")
         self.quick_profile_latency_label.setObjectName("softHint")
@@ -501,9 +440,21 @@ class MainWindow(QMainWindow):
         profiles_layout.setContentsMargins(10, 10, 10, 10)
         profiles_layout.setSpacing(8)
 
-        profiles_title = QLabel("Profiles")
+        profiles_title = QLabel("Конфиги")
         profiles_title.setObjectName("sectionTitle")
         profiles_layout.addWidget(profiles_title)
+
+        source_row = QHBoxLayout()
+        source_row.setSpacing(6)
+        self.manual_source_btn = QPushButton("Мои конфиги")
+        self.sub_source_btn = QPushButton("Из подписок")
+        for button in (self.manual_source_btn, self.sub_source_btn):
+            button.setObjectName("sourceTab")
+            button.setCheckable(True)
+            button.setMinimumHeight(36)
+            source_row.addWidget(button, 1)
+        self.manual_source_btn.setChecked(True)
+        profiles_layout.addLayout(source_row)
 
         self.profile_latency_label = QLabel("Latency update: never")
         self.profile_latency_label.setObjectName("softHint")
@@ -542,35 +493,37 @@ class MainWindow(QMainWindow):
         self.ping_btn.clicked.connect(self.refresh_latencies)
         profile_filters.addWidget(self.ping_btn)
 
-        self.update_subs_btn = QPushButton("🔄 Update")
-        self.update_subs_btn.setToolTip("Update all subscriptions (Ctrl+U)")
-        self.update_subs_btn.clicked.connect(lambda: self.update_all_subscriptions(silent=False))
-        profile_filters.addWidget(self.update_subs_btn)
-
-        self.manage_subs_btn = QPushButton("📋 Subs")
-        self.manage_subs_btn.setToolTip("Manage subscriptions")
-        self.manage_subs_btn.clicked.connect(self.show_subscriptions_dialog)
-        profile_filters.addWidget(self.manage_subs_btn)
-
-        self.add_sub_btn = QPushButton("➕")
-        self.add_sub_btn.setToolTip("Add subscription")
-        self.add_sub_btn.setFixedWidth(40)
-        self.add_sub_btn.clicked.connect(self.add_subscription_dialog)
-        profile_filters.addWidget(self.add_sub_btn)
-
         profiles_layout.addLayout(profile_filters)
+
+        source_actions = QHBoxLayout()
+        source_actions.setSpacing(7)
+        self.import_btn = QPushButton("+ Импорт")
+        self.import_btn.setObjectName("primaryAction")
+        self.import_btn.clicked.connect(self.import_config)
+        source_actions.addWidget(self.import_btn)
+        self.clip_btn = QPushButton("Вставить")
+        self.clip_btn.clicked.connect(self.import_from_clipboard)
+        source_actions.addWidget(self.clip_btn)
+        self.update_subs_btn = QPushButton("Обновить")
+        self.update_subs_btn.clicked.connect(lambda: self.update_all_subscriptions(silent=False))
+        source_actions.addWidget(self.update_subs_btn)
+        self.manage_subs_btn = QPushButton("Подписки")
+        self.manage_subs_btn.clicked.connect(self.show_subscriptions_dialog)
+        source_actions.addWidget(self.manage_subs_btn)
+        source_actions.addStretch(1)
+        profiles_layout.addLayout(source_actions)
 
         self.subs_filter_row = QWidget()
         subs_filter_layout = QHBoxLayout(self.subs_filter_row)
         subs_filter_layout.setContentsMargins(0, 0, 0, 0)
         subs_filter_layout.setSpacing(8)
-        subs_filter_label = QLabel("Sub:")
+        subs_filter_label = QLabel("Источник:")
         subs_filter_label.setObjectName("softHint")
         subs_filter_layout.addWidget(subs_filter_label)
         self.subs_filter_combo = QComboBox()
         self.subs_filter_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.subs_filter_combo.setMinimumContentsLength(14)
-        self.subs_filter_combo.setToolTip("Filter profiles by subscription")
+        self.subs_filter_combo.setToolTip("Показать серверы выбранной подписки")
         subs_filter_layout.addWidget(self.subs_filter_combo, 1)
         self.subs_filter_row.setVisible(False)
         profiles_layout.addWidget(self.subs_filter_row)
@@ -587,25 +540,20 @@ class MainWindow(QMainWindow):
         self.profile_list.setContextMenuPolicy(Qt.CustomContextMenu)
         profiles_layout.addWidget(self.profile_list, 1)
 
-        self.profile_list_hint = QLabel("Double-click to connect · drop files here to import")
+        self.profile_list_hint = QLabel("Двойной клик — подключиться · перетащите файл для импорта")
         self.profile_list_hint.setObjectName("softHint")
         self.profile_list_hint.setWordWrap(True)
         profiles_layout.addWidget(self.profile_list_hint)
 
         profile_buttons = QHBoxLayout()
         profile_buttons.setSpacing(8)
-        import_btn = QPushButton("Import file")
-        import_btn.clicked.connect(self.import_config)
-        clip_btn = QPushButton("Paste clipboard")
-        clip_btn.clicked.connect(self.import_from_clipboard)
-        export_btn = QPushButton("Export")
+        export_btn = QPushButton("Экспорт")
         export_btn.clicked.connect(self.export_selected_profile)
-        delete_btn = QPushButton("Delete")
-        delete_btn.clicked.connect(self.delete_selected_profile)
-        profile_buttons.addWidget(import_btn)
-        profile_buttons.addWidget(clip_btn)
+        self.delete_profile_btn = QPushButton("Удалить конфиг")
+        self.delete_profile_btn.clicked.connect(self.delete_selected_profile)
+        profile_buttons.addStretch(1)
         profile_buttons.addWidget(export_btn)
-        profile_buttons.addWidget(delete_btn)
+        profile_buttons.addWidget(self.delete_profile_btn)
         profiles_layout.addLayout(profile_buttons)
         self.content_stack.addWidget(profiles_tab)
 
@@ -903,38 +851,46 @@ class MainWindow(QMainWindow):
         diagnostics_layout.addWidget(self.diag_details, 1)
         self.content_stack.addWidget(diagnostics_tab)
 
+        self.subscriptions_panel = SubscriptionsPanel(self)
+        self.content_stack.addWidget(self.subscriptions_panel)  # index 6
+
         bottom_nav = QFrame()
-        bottom_nav.setObjectName('bottomNav')
+        bottom_nav.setObjectName("bottomNav")
         self.bottom_nav = bottom_nav
         nav_layout = QHBoxLayout(bottom_nav)
         nav_layout.setContentsMargins(0, 0, 0, 0)
-        nav_layout.setSpacing(8)
-
+        nav_layout.setSpacing(5)
         self.nav_buttons: list[QPushButton] = []
-        self._mobile_pages = [0, 1, 2, 3, 5]
-        for index, label in enumerate(['VPN', 'Servers', 'Rules', 'Apps', 'Health']):
+        self._mobile_pages = [0, 1, 6]
+        for index, label in enumerate(["VPN", "Конфиги", "Подписки"]):
             btn = QPushButton(label)
             btn.setObjectName("navBtn")
             btn.setCheckable(True)
-            btn.setToolTip(f"{label} (Ctrl+{index + 1})")
             btn.clicked.connect(lambda _checked=False, i=index: self._set_bottom_page(self._mobile_pages[i]))
             nav_layout.addWidget(btn, 1)
             self.nav_buttons.append(btn)
-
+        self.more_btn = QPushButton("Ещё ▾")
+        self.more_btn.setObjectName("navBtn")
+        self.more_btn.setToolTip("Маршруты, приложения, диагностика и логи")
+        more_menu = QMenu(self.more_btn)
+        for label, page in [("Маршрутизация", 2), ("Приложения", 3),
+                            ("Диагностика", 5), ("Логи", 4)]:
+            action = more_menu.addAction(label)
+            action.triggered.connect(lambda _checked=False, i=page: self._set_bottom_page(i))
+        self.more_btn.setMenu(more_menu)
+        nav_layout.addWidget(self.more_btn)
         phone_layout.addWidget(bottom_nav)
         self._set_bottom_page(0)
         main.addWidget(phone_shell, 1)
-
-        for index in range(4):
-            shortcut = QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self)
+        for key, page in [("Ctrl+1", 0), ("Ctrl+2", 1), ("Ctrl+3", 6)]:
+            shortcut = QShortcut(QKeySequence(key), self)
             shortcut.setContext(Qt.ApplicationShortcut)
-            shortcut.activated.connect(lambda i=index: self._set_bottom_page(i))
+            shortcut.activated.connect(lambda i=page: self._set_bottom_page(i))
         fastest_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
         fastest_shortcut.setContext(Qt.ApplicationShortcut)
         fastest_shortcut.activated.connect(self._connect_fastest)
 
         self.statusBar().showMessage('Disconnected')
-        QTimer.singleShot(0, self._apply_responsive_layout)
 
         self.setStyleSheet(
             """
@@ -1222,7 +1178,16 @@ class MainWindow(QMainWindow):
             QFrame#phoneShell { background: #101722; border-radius: 17px; }
             QMainWindow { background-color: #0b111a; }
             QWidget#root { background: #0b111a; }
-            #connectBtn { border-color: #65d9bb; color: #f1fff9; }
+            #connectBtn { border-color: #65d9bb; color: #f1fff9; border-radius: 20px; font-size: 20px; }
+            QPushButton#sourceTab { border-radius: 9px; color: #9aaabd; }
+            QPushButton#sourceTab:checked { background-color: #214e58; border-color: #4fb5a8; color: #e8fff5; }
+            QPushButton#primaryAction { background-color: #245c61; border: 1px solid #39988e; color: #e8fff5; }
+            QPushButton#primaryAction:hover { background-color: #287276; }
+            QFrame#subscriptionCard { background-color: #182331; border: 1px solid #2b4050; border-radius: 12px; }
+            QLabel#subscriptionName { font-size: 13px; font-weight: 700; color: #eff7ff; }
+            QProgressBar#subscriptionProgress { background-color: #273643; border: none; border-radius: 2px; }
+            QProgressBar#subscriptionProgress::chunk { background-color: #5dc9a4; border-radius: 2px; }
+            QPushButton#navBtn[active="true"] { background-color: #17414b; border-color: #48b4ae; color: #a0f5df; }
             #connectBtn:hover { border-color: #9cfad9; color: #9cfad9; }
             #connectBtn[vpnState="connected"] { border-color: #5ed0ae; color: #7bf4c9; }
             QPushButton#navBtn:checked {
@@ -1416,23 +1381,33 @@ class MainWindow(QMainWindow):
             self.tray_icon.showMessage(title, message, QSystemTrayIcon.Information, 3000)
 
     def _set_bottom_page(self, index: int) -> None:
-        if index < 0 or index >= self.content_stack.count():
+        if not 0 <= index < self.content_stack.count():
             return
         self.content_stack.setCurrentIndex(index)
-        for i, button in enumerate(self.nav_buttons):
-            button.setChecked(self._mobile_pages[i] == index)
-        for page, button in self.side_nav_buttons.items():
+        for page, button in zip(self._mobile_pages, self.nav_buttons):
             button.setChecked(page == index)
+        self.more_btn.setProperty("active", index not in self._mobile_pages)
+        self.more_btn.style().unpolish(self.more_btn)
+        self.more_btn.style().polish(self.more_btn)
+        if index == 6:
+            self.subscriptions_panel.refresh_list()
 
-    def _apply_responsive_layout(self) -> None:
-        desktop = self.width() >= 840
-        self.side_nav.setVisible(desktop)
-        self.bottom_nav.setVisible(not desktop)
+    def _set_profile_source(self, source: str, sub_id: str = "") -> None:
+        if source not in {"manual", "subscriptions"}:
+            return
+        self._profile_source = source
+        self._selected_sub_id = sub_id if source == "subscriptions" else ""
+        self.settings.setValue("ui/config_source", source)
+        self.manual_source_btn.setChecked(source == "manual")
+        self.sub_source_btn.setChecked(source == "subscriptions")
+        self._selected_location = "ALL"
+        self._refresh_profile_views(preserve_selection=False)
 
-    def resizeEvent(self, event) -> None:  # type: ignore[override]
-        super().resizeEvent(event)
-        if hasattr(self, 'side_nav') and hasattr(self, 'bottom_nav'):
-            self._apply_responsive_layout()
+    def _show_subscription_nodes(self, sub_id: str) -> None:
+        if not self.subscription_store.get(sub_id):
+            return
+        self._set_profile_source("subscriptions", sub_id)
+        self._set_bottom_page(1)
 
     def _profile_item_text(self, index: int) -> str:
         profile = self.profiles[index]
@@ -1568,10 +1543,8 @@ class MainWindow(QMainWindow):
                     filtered.append(idx)
             indices = filtered
 
-        if self._selected_sub_id == "__manual__":
-            indices = [idx for idx in indices if not self.profiles[idx].subscription_id]
-        elif self._selected_sub_id:
-            indices = [idx for idx in indices if self.profiles[idx].subscription_id == self._selected_sub_id]
+        allowed = set(profile_indices_for_source(self.profiles, self._profile_source, self._selected_sub_id))
+        indices = [idx for idx in indices if idx in allowed]
 
         sort_mode = str(self.profile_sort_combo.currentData() or "manual")
         if sort_mode == "name":
@@ -1620,104 +1593,24 @@ class MainWindow(QMainWindow):
             manual_mode
             and not self.profile_search_edit.text().strip()
             and self._selected_location == "ALL"
-            and not self._selected_sub_id
+            and self._profile_source == "manual"
         )
         self.profile_list.setDragEnabled(drag_enabled)
         self.profile_list.setDragDropMode(QAbstractItemView.InternalMove if drag_enabled else QAbstractItemView.NoDragDrop)
-        if drag_enabled and self._is_grouped_view():
-            self.profile_list_hint.setText(
-                "Click a subscription to expand/collapse it. Drag to reorder within a section. Drop files here to import."
-            )
-        elif drag_enabled:
-            self.profile_list_hint.setText(
-                "Right click for actions. Drag to reorder in manual mode. Double click to connect. Drop files here to import."
-            )
-        else:
-            self.profile_list_hint.setText(
-                "Right click for actions. Drag reorder is available only in manual order without filters. Drop files here to import."
-            )
-
-    def _is_grouped_view(self) -> bool:
-        """Grouped view: a manual section plus one collapsible row per subscription.
-
-        Any active filter (search, location, single subscription) switches back
-        to the flat list.
-        """
-        if self.profile_search_edit.text().strip():
-            return False
-        if self._selected_location != "ALL" or self._selected_sub_id:
-            return False
-        return bool(self.subscription_store.all())
-
-    def _selected_sub_header(self) -> str | None:
-        item = self.profile_list.currentItem()
-        if item is None:
-            return None
-        data = item.data(Qt.UserRole)
-        if isinstance(data, tuple) and len(data) == 2 and data[0] == "sub":
-            return str(data[1])
-        return None
-
-    def _select_sub_header(self, sub_id: str) -> None:
-        for row in range(self.profile_list.count()):
-            item = self.profile_list.item(row)
-            if item is not None and item.data(Qt.UserRole) == ("sub", sub_id):
-                self.profile_list.setCurrentRow(row)
-                return
+        self.profile_list_hint.setText(
+            "Перетаскивайте для сортировки · двойной клик для подключения" if drag_enabled
+            else "Двойной клик — подключиться · правый клик — действия"
+        )
 
     def _ensure_profile_visible(self, profile_index: int) -> None:
-        """Reveal a profile hidden inside a collapsed subscription (grouped view).
-
-        Call before selecting a profile programmatically: otherwise the
-        selection silently stays on the old row while actions apply to the new
-        profile.
-        """
         if not 0 <= profile_index < len(self.profiles):
             return
-        sub_id = self.profiles[profile_index].subscription_id
-        if sub_id and self._is_grouped_view() and sub_id not in self._expanded_sub_ids:
-            self._expanded_sub_ids.add(sub_id)
-            self.settings.setValue("ui/expanded_sub_ids", json.dumps(sorted(self._expanded_sub_ids)))
-            self._rebuild_profile_list(preserve_selection=True)
-
-    def _toggle_sub_expanded(self, sub_id: str) -> None:
-        if sub_id in self._expanded_sub_ids:
-            self._expanded_sub_ids.discard(sub_id)
-        else:
-            self._expanded_sub_ids.add(sub_id)
-        self.settings.setValue("ui/expanded_sub_ids", json.dumps(sorted(self._expanded_sub_ids)))
-        self._rebuild_profile_list(preserve_selection=False)
-        self._select_sub_header(sub_id)
-
-    def _on_profile_item_left_clicked(self, item) -> None:
-        """Single click on a subscription header expands/collapses it."""
-        if item is None:
-            return
-        data = item.data(Qt.UserRole)
-        if not (isinstance(data, tuple) and len(data) == 2 and data[0] == "sub"):
-            return
-        # A double click produces two clicks: debounce so it toggles once.
-        now = time.monotonic()
-        if now - self._last_header_toggle < 0.35:
-            return
-        self._last_header_toggle = now
-        self._toggle_sub_expanded(str(data[1]))
-
-    def _sub_header_text(self, sub: Subscription, node_count: int, expanded: bool) -> str:
-        arrow = "▼" if expanded else "▶"
-        stats = sub.traffic_stats()
-        if not stats.has_data:
-            traffic = ""
-        elif stats.unlimited:
-            traffic = "unlimited" if stats.used <= 0 else f"used {format_bytes(stats.used)} (unlimited)"
-        elif stats.over_quota:
-            traffic = "⚠ over quota"
-        elif stats.remaining is None:
-            traffic = ""
-        else:
-            traffic = f"left {format_bytes(stats.remaining)}"
-        suffix = f"  ·  {traffic}" if traffic else ""
-        return f"{arrow} 📌 {sub.name} ({node_count}){suffix}"
+        profile = self.profiles[profile_index]
+        target_source = "subscriptions" if profile.subscription_id else "manual"
+        if (self._profile_source != target_source or
+                (target_source == "subscriptions" and self._selected_sub_id and
+                 self._selected_sub_id != profile.subscription_id)):
+            self._set_profile_source(target_source, profile.subscription_id or "")
 
     def _add_profile_row(self, profile_index: int) -> None:
         item = QListWidgetItem(self._profile_item_text(profile_index))
@@ -1745,24 +1638,6 @@ class MainWindow(QMainWindow):
         self.profile_list.addItem(item)
         self._profile_row_items[profile_index] = item
 
-    def _add_manual_section_header(self, count: int) -> None:
-        header = QListWidgetItem(f"📁 Manual configs ({count})")
-        header.setData(Qt.UserRole, "manual-header")
-        header.setFlags(Qt.ItemIsEnabled)  # label row, not selectable
-        header.setToolTip("Configs added manually (import / paste)")
-        self.profile_list.addItem(header)
-
-    def _add_sub_section_header(self, sub: Subscription, node_count: int) -> None:
-        expanded = sub.id in self._expanded_sub_ids
-        header = QListWidgetItem(self._sub_header_text(sub, node_count, expanded))
-        header.setData(Qt.UserRole, ("sub", sub.id))
-        summary = sub.userinfo_summary()
-        tooltip = [sub.name, f"Nodes: {node_count}"]
-        tooltip.append(summary if summary else "No traffic info")
-        tooltip.append("Click to " + ("collapse" if expanded else "expand"))
-        header.setToolTip("\n".join(tooltip))
-        self.profile_list.addItem(header)
-
     def _select_first_selectable_row(self) -> None:
         for row in range(self.profile_list.count()):
             item = self.profile_list.item(row)
@@ -1773,51 +1648,32 @@ class MainWindow(QMainWindow):
 
     def _rebuild_profile_list(self, preserve_selection: bool = True) -> None:
         selected = self._selected_profile_index() if preserve_selection else None
-        selected_sub = self._selected_sub_header() if preserve_selection else None
         ordered = self._sorted_profile_indices()
-        grouped = self._is_grouped_view()
         self.profile_list.blockSignals(True)
         self._profile_row_items.clear()
         self.profile_list.clear()
-        if grouped:
-            self._visible_profile_indices = []
-            manual = [idx for idx in ordered if not self.profiles[idx].subscription_id]
-            if manual:
-                self._add_manual_section_header(len(manual))
-                for profile_index in manual:
-                    self._add_profile_row(profile_index)
-                    self._visible_profile_indices.append(profile_index)
-            for sub in self.subscription_store.all():
-                nodes = [idx for idx in ordered if self.profiles[idx].subscription_id == sub.id]
-                self._add_sub_section_header(sub, len(nodes))
-                if sub.id in self._expanded_sub_ids:
-                    for profile_index in nodes:
-                        self._add_profile_row(profile_index)
-                        self._visible_profile_indices.append(profile_index)
-        else:
-            self._visible_profile_indices = ordered
-            for profile_index in ordered:
-                self._add_profile_row(profile_index)
+        self._visible_profile_indices = ordered
+        for profile_index in ordered:
+            self._add_profile_row(profile_index)
         self.profile_list.blockSignals(False)
         self._update_profile_list_capabilities()
 
         if selected is not None:
             self._set_selected_profile_index(selected)
-        elif selected_sub is not None:
-            self._select_sub_header(selected_sub)
         else:
             self._select_first_selectable_row()
 
-        if not self.profiles:
-            self.profiles_empty_label.setText(
-                "No profiles yet.\nAdd a subscription (➕ above), import a file, or paste from clipboard."
-            )
-            self.profiles_empty_label.setVisible(True)
-        elif not self._visible_profile_indices and self.profile_list.count() == 0:
-            self.profiles_empty_label.setText("No profiles match the current search or filters.")
-            self.profiles_empty_label.setVisible(True)
+        if not ordered:
+            if self._profile_source == "manual":
+                message = "Нет ручных конфигов.\nНажмите «Импорт» или «Вставить»."
+            elif not self.subscription_store.all():
+                message = "Нет подписок. Добавьте подписку на соседней вкладке."
+            else:
+                message = "Нет серверов для выбранной подписки или фильтра."
+            self.profiles_empty_label.setText(message)
+            self.profiles_empty_label.show()
         else:
-            self.profiles_empty_label.setVisible(False)
+            self.profiles_empty_label.hide()
 
     def _refresh_profile_rows(self, index: int | None = None) -> None:
         """Incremental update: O(1) for a tick of one active server."""
@@ -1911,39 +1767,29 @@ class MainWindow(QMainWindow):
 
     def _refresh_subs_filter(self) -> None:
         subs = self.subscription_store.all()
-        counts: dict[str, int] = {}
-        manual_count = 0
-        for profile in self.profiles:
-            if profile.subscription_id:
-                counts[profile.subscription_id] = counts.get(profile.subscription_id, 0) + 1
-            else:
-                manual_count += 1
-
-        if self._selected_sub_id and self._selected_sub_id != "__manual__":
-            if not any(sub.id == self._selected_sub_id for sub in subs):
-                self._selected_sub_id = ""
-
-        live_ids = {sub.id for sub in subs}
-        if self._expanded_sub_ids - live_ids:
-            self._expanded_sub_ids &= live_ids
-            self.settings.setValue("ui/expanded_sub_ids", json.dumps(sorted(self._expanded_sub_ids)))
-
+        if self._selected_sub_id and not any(s.id == self._selected_sub_id for s in subs):
+            self._selected_sub_id = ""
         self.subs_filter_combo.blockSignals(True)
         self.subs_filter_combo.clear()
-        self.subs_filter_combo.addItem(f"All ({len(self.profiles)})", "")
-        target_index = 0
-        if manual_count:
-            self.subs_filter_combo.addItem(f"📁 Manual imports ({manual_count})", "__manual__")
-            if self._selected_sub_id == "__manual__":
-                target_index = self.subs_filter_combo.count() - 1
+        self.subs_filter_combo.addItem("Все подписки", "")
+        selected_index = 0
         for sub in subs:
-            count = counts.get(sub.id, sub.profile_count)
-            self.subs_filter_combo.addItem(f"📌 {sub.name} ({count})", sub.id)
-            if sub.id == self._selected_sub_id:
-                target_index = self.subs_filter_combo.count() - 1
-        self.subs_filter_combo.setCurrentIndex(target_index)
+            count = sum(p.subscription_id == sub.id for p in self.profiles)
+            self.subs_filter_combo.addItem(f"{sub.name} ({count})", sub.id)
+            if self._selected_sub_id == sub.id:
+                selected_index = self.subs_filter_combo.count() - 1
+        self.subs_filter_combo.setCurrentIndex(selected_index)
         self.subs_filter_combo.blockSignals(False)
-        self.subs_filter_row.setVisible(bool(subs))
+        subscribed = self._profile_source == "subscriptions"
+        self.subs_filter_row.setVisible(subscribed and bool(subs))
+        self.manual_source_btn.setChecked(not subscribed)
+        self.sub_source_btn.setChecked(subscribed)
+        self.import_btn.setVisible(not subscribed)
+        self.clip_btn.setVisible(not subscribed)
+        self.update_subs_btn.setVisible(subscribed)
+        self.update_subs_btn.setEnabled(bool(subs))
+        self.manage_subs_btn.setVisible(subscribed)
+        self.delete_profile_btn.setVisible(not subscribed)
 
     def _on_subs_filter_changed(self, index: int) -> None:
         if index < 0:
@@ -2053,7 +1899,6 @@ class MainWindow(QMainWindow):
         self.profile_list.currentRowChanged.connect(self._on_profile_list_row_changed)
         self.profile_list.customContextMenuRequested.connect(self._show_profile_context_menu)
         self.profile_list.itemDoubleClicked.connect(lambda _item: self._connect_selected_profile())
-        self.profile_list.item_left_clicked.connect(self._on_profile_item_left_clicked)
         self.profile_list.files_dropped.connect(self._import_dropped_files)
         self.profile_list.links_dropped.connect(self._import_dropped_links)
         self.profile_list.items_reordered.connect(self._on_profile_items_reordered)
@@ -2065,6 +1910,14 @@ class MainWindow(QMainWindow):
         self.profile_sort_combo.currentIndexChanged.connect(self._on_profile_filter_changed)
         self.profile_location_combo.currentIndexChanged.connect(self._on_location_combo_changed)
         self.subs_filter_combo.currentIndexChanged.connect(self._on_subs_filter_changed)
+        self.manual_source_btn.clicked.connect(lambda: self._set_profile_source("manual"))
+        self.sub_source_btn.clicked.connect(lambda: self._set_profile_source("subscriptions"))
+        self.subscriptions_panel.update_single_signal.connect(self.update_subscription)
+        self.subscriptions_panel.update_all_signal.connect(self.update_all_subscriptions)
+        self.subscriptions_panel.add_subscription_signal.connect(self._add_subscription_from_dialog)
+        self.subscriptions_panel.edit_subscription_link_signal.connect(self.change_subscription_link)
+        self.subscriptions_panel.delete_subscription_signal.connect(self.delete_subscription)
+        self.subscriptions_panel.nodes_requested.connect(self._show_subscription_nodes)
         self.copy_logs_btn.clicked.connect(self.copy_logs)
         self.clear_logs_btn.clicked.connect(self.clear_logs)
         self.open_log_file_btn.clicked.connect(self.open_log_file)
@@ -2108,7 +1961,6 @@ class MainWindow(QMainWindow):
         route_domains_text = self.settings.value("route_domains_text", "", type=str) or ""
         usage_raw = self.settings.value("profile_usage_bytes", "{}", type=str) or "{}"
         last_used_raw = self.settings.value("profile_last_used", "{}", type=str) or "{}"
-        expanded_raw = self.settings.value("ui/expanded_sub_ids", "[]", type=str) or "[]"
         fav_raw = self.settings.value('ui/favorites', '[]', type=str) or '[]'
         quality_raw = self.settings.value('profile_quality', '{}', type=str) or '{}'
         try:
@@ -2120,13 +1972,6 @@ class MainWindow(QMainWindow):
             self.quality = QualityTracker(json.loads(quality_raw))
         except (TypeError, ValueError):
             self.quality = QualityTracker()
-        try:
-            parsed_expanded = json.loads(expanded_raw)
-            self._expanded_sub_ids = (
-                {str(x) for x in parsed_expanded} if isinstance(parsed_expanded, list) else set()
-            )
-        except ValueError:
-            self._expanded_sub_ids = set()
         try:
             parsed_usage = json.loads(usage_raw)
             if isinstance(parsed_usage, dict):
@@ -2144,6 +1989,8 @@ class MainWindow(QMainWindow):
         except (ValueError, TypeError):
             self._last_used_store = {}
 
+        source = self.settings.value("ui/config_source", "manual", type=str)
+        self._profile_source = source if source in {"manual", "subscriptions"} else "manual"
         self.auto_switch_checkbox.setChecked(auto_switch)
         self.auto_update_subs_checkbox.setChecked(auto_update_subs)
         self.auto_reconnect_checkbox.setChecked(auto_reconnect)
@@ -2594,6 +2441,7 @@ class MainWindow(QMainWindow):
         if match:
             link = match.group(1).rstrip("\"';,.<>")
 
+        self.subscriptions_panel.set_feedback("Добавление подписки…")
         self._append_log(f"Importing subscription / Happ link from {source_label}")
         worker = threading.Thread(
             target=self._happ_import_worker,
@@ -2613,6 +2461,7 @@ class MainWindow(QMainWindow):
             meta = {
                 "sub_id": sub_id,
                 "name": sub_name,
+                "custom_name": bool(custom_name.strip()),
                 "url": target_url,
                 "original_link": link,
                 "headers_info": headers_info,
@@ -2632,7 +2481,9 @@ class MainWindow(QMainWindow):
 
     def _on_happ_import_finished(self, source_label: str, loaded: object, error: str) -> None:
         if error:
-            self._show_error(f"Failed to import from {source_label}: {error}")
+            safe_error = redact(error)
+            self.subscriptions_panel.set_feedback(f"Не удалось добавить: {safe_error}", error=True)
+            self._show_error(f"Failed to import from {source_label}: {safe_error}")
             return
 
         profiles: list[Profile] = []
@@ -2658,15 +2509,21 @@ class MainWindow(QMainWindow):
                 profile_count=len(profiles),
                 user_info=meta.get("headers_info", {}).get("user_info", {}) if isinstance(meta.get("headers_info"), dict) else {},
             )
+            existing = self.subscription_store.get(sub_id)
+            if existing:
+                sub.auto_update = existing.auto_update
+                if not meta.get("custom_name"):
+                    sub.name = existing.name
+                if not sub.user_info:
+                    sub.user_info = existing.user_info
             self.subscription_store.put(sub)
             self._notify_quota(sub)
             self._apply_updated_subscription_profiles(sub_id, profiles)
         else:
             self._apply_loaded_profiles(profiles)
 
-        if self._subs_dialog and self._subs_dialog.isVisible():
-            self._subs_dialog.refresh_list()
-
+        self.subscriptions_panel.set_feedback(f"Добавлено серверов: {len(profiles)}")
+        self.subscriptions_panel.refresh_list()
         self._append_log(f"Imported {len(profiles)} profile(s) from {source_label}")
         self._notify_user("Profiles imported", f"Imported {len(profiles)} profile(s)")
 
@@ -2681,28 +2538,27 @@ class MainWindow(QMainWindow):
                 self._queue_subscription_update(sub, silent=True)
 
     def show_subscriptions_dialog(self) -> None:
-        if self._subs_dialog is None:
-            self._subs_dialog = SubscriptionsDialog(self)
-            self._subs_dialog.update_single_signal.connect(self.update_subscription)
-            self._subs_dialog.update_all_signal.connect(self.update_all_subscriptions)
-            self._subs_dialog.add_subscription_signal.connect(self._add_subscription_from_dialog)
-            self._subs_dialog.delete_subscription_signal.connect(self.delete_subscription)
-        self._subs_dialog.refresh_list()
-        self._subs_dialog.show()
-        self._subs_dialog.raise_()
-        self._subs_dialog.activateWindow()
+        """Backward-compatible entry point; subscriptions now live in the main window."""
+        self._set_bottom_page(6)
 
     def add_subscription_dialog(self) -> None:
-        url, ok = QInputDialog.getText(
-            self,
-            "Add subscription",
-            "Enter Happ link or HTTPS subscription URL:",
-        )
-        if ok and url.strip():
-            self._start_happ_import(url.strip(), "dialog")
+        self.show_subscriptions_dialog()
+        self.subscriptions_panel.open_add_dialog()
 
     def _add_subscription_from_dialog(self, url: str, name: str) -> None:
         self._start_happ_import(url, "dialog", custom_name=name)
+
+    def change_subscription_link(self, sub_id: str, link: str) -> None:
+        sub = self.subscription_store.get(sub_id)
+        if not sub:
+            return
+        if sub.id in self._subs_inflight:
+            self.subscriptions_panel.set_update_state(sub_id, "Дождитесь текущего обновления", busy=True)
+            return
+        # Test the new link before saving it. A bad link must not destroy a
+        # valid subscription or its nodes.
+        self._pending_subscription_links[sub_id] = link.strip()
+        self._queue_subscription_update(sub, silent=False, force=True, source_url=link.strip())
 
     def update_subscription(self, sub_id: str) -> None:
         sub = self.subscription_store.get(sub_id)
@@ -2725,16 +2581,17 @@ class MainWindow(QMainWindow):
                 self._queue_subscription_update(sub, silent=False, force=True)
 
     def _queue_subscription_update(self, sub: Subscription, *, silent: bool,
-                                   force: bool = False) -> None:
+                                   force: bool = False, source_url: str | None = None) -> None:
         if sub.id in self._subs_inflight:
             return
         if not force and time.time() < self._subscription_retry_at.get(sub.id, 0):
             return
         self._subs_inflight.add(sub.id)
+        self.subscriptions_panel.set_update_state(sub.id, "Обновление…", busy=True)
         if silent:
             self._subs_silent.add(sub.id)
         self._subscription_pool.submit(self._subscription_update_worker,
-                                       sub.id, sub.original_link or sub.url, sub.name)
+                                       sub.id, source_url or sub.original_link or sub.url, sub.name)
 
     def _notify_quota(self, sub: Subscription) -> None:
         stats = sub.traffic_stats()
@@ -2770,29 +2627,41 @@ class MainWindow(QMainWindow):
         silent = sub_id in self._subs_silent
         self._subs_silent.discard(sub_id)
         sub = self.subscription_store.get(sub_id)
-        sub_name = sub.name if sub else sub_id
+        if sub is None:
+            # An in-flight update must never resurrect a deleted subscription.
+            return
+        sub_name = sub.name
         if error:
+            self._pending_subscription_links.pop(sub_id, None)
             failures = self._subscription_failures.get(sub_id, 0) + 1
             self._subscription_failures[sub_id] = failures
             self._subscription_retry_at[sub_id] = time.time() + min(6 * 3600, 600 * 2 ** (failures - 1))
             self._append_log(f"Failed to update subscription '{sub_name}': {redact(error)}")
-            if not silent:
+            self.subscriptions_panel.set_update_state(sub_id, f"Ошибка: {redact(error)}", error=True)
+            if not silent and self.content_stack.currentIndex() != 6:
                 self._show_error(f"Subscription update failed ({sub_name}): {redact(error)}")
             return
         self._subscription_failures.pop(sub_id, None)
         self._subscription_retry_at.pop(sub_id, None)
         if not isinstance(profiles, list) or not profiles:
+            self._pending_subscription_links.pop(sub_id, None)
             self._append_log(f"Subscription '{sub_name}' returned no profiles")
             # Still persist quota info from the response headers when present.
             if sub and isinstance(headers_info, dict) and headers_info.get("user_info"):
                 sub.user_info = headers_info["user_info"]
                 sub.updated_at = time.time()
                 self.subscription_store.put(sub)
-            if not silent:
+            self.subscriptions_panel.set_update_state(sub_id, "Серверы не найдены", error=True)
+            if not silent and self.content_stack.currentIndex() != 6:
                 self._show_error(f"Subscription '{sub_name}' returned no profiles")
             return
 
         loaded_profiles = [p for p in profiles if isinstance(p, Profile)]
+        # Persist a newly edited URL only if the fetch returned usable nodes.
+        edited_link = self._pending_subscription_links.pop(sub_id, None)
+        if edited_link:
+            sub.original_link = edited_link
+            sub.url = edited_link
         if sub:
             sub.updated_at = time.time()
             sub.profile_count = len(loaded_profiles)
@@ -2804,8 +2673,8 @@ class MainWindow(QMainWindow):
 
         self._apply_updated_subscription_profiles(sub_id, loaded_profiles)
         self._append_log(f"Updated subscription '{sub_name}': {len(loaded_profiles)} profile(s)")
-        if self._subs_dialog and self._subs_dialog.isVisible():
-            self._subs_dialog.refresh_list()
+        self.subscriptions_panel.set_update_state(sub_id, f"Готово · {len(loaded_profiles)} серверов")
+        self.subscriptions_panel.refresh_list()
 
     def delete_subscription(self, sub_id: str) -> None:
         sub = self.subscription_store.get(sub_id)
@@ -2813,7 +2682,7 @@ class MainWindow(QMainWindow):
             return
         indices_to_remove = [i for i, p in enumerate(self.profiles) if p.subscription_id == sub_id]
         if self.connected_index in indices_to_remove:
-            self.vpn.request_disconnect()
+            self._stop_connection()
             self.connected_index = None
 
         self.profiles = [p for i, p in enumerate(self.profiles) if i not in indices_to_remove]
@@ -2821,6 +2690,9 @@ class MainWindow(QMainWindow):
         self.profile_usage_bytes = [u for i, u in enumerate(self.profile_usage_bytes) if i not in indices_to_remove]
 
         self.subscription_store.remove(sub_id)
+        self._pending_subscription_links.pop(sub_id, None)
+        self._subs_inflight.discard(sub_id)
+        self.subscriptions_panel.refresh_list()
         self._pending_latency_indices = set(range(len(self.profiles)))
         self._save_profiles()
         self._refresh_location_filter()
@@ -2873,7 +2745,8 @@ class MainWindow(QMainWindow):
         if connected is not None and connected.subscription_id == sub_id and not any(
             p.id == connected.id for p in new_items
         ) and self.vpn.status in {'connected', 'connecting'}:
-            connected.subscription_id = None
+            # Keep the source association: a temporary provider node must not
+            # suddenly appear in the user's manually imported configurations.
             connected.name += ' (active, removed from subscription)'
             new_items.append(connected)
             self._append_log('Active server disappeared from subscription; keeping current tunnel until disconnect.')
@@ -2994,6 +2867,9 @@ class MainWindow(QMainWindow):
         if index is None:
             self._show_error("Choose a profile to delete")
             return
+        if self.profiles[index].subscription_id:
+            self._show_error("Сервер управляется подпиской. Откройте раздел «Подписки».")
+            return
         if not self._confirm_delete_profile(index):
             return
         self._delete_profile_at_index(index)
@@ -3089,39 +2965,28 @@ class MainWindow(QMainWindow):
         self._append_log(f"Exported profile to: {target}")
         self._notify_user("Profile exported", profile.name)
 
-    def _show_sub_header_context_menu(self, sub_id: str, pos) -> None:
-        self._select_sub_header(sub_id)
-        sub = self.subscription_store.get(sub_id)
-        menu = QMenu(self)
-        expanded = sub_id in self._expanded_sub_ids
-        toggle_action = menu.addAction("Collapse" if expanded else "Expand")
-        update_action = menu.addAction(f'Update "{sub.name}"' if sub else "Update subscription")
-        selected_action = menu.exec(self.profile_list.viewport().mapToGlobal(pos))
-        if selected_action is toggle_action:
-            self._toggle_sub_expanded(sub_id)
-        elif selected_action is update_action:
-            self.update_subscription(sub_id)
-
     def _show_profile_context_menu(self, pos) -> None:
         item = self.profile_list.itemAt(pos)
         menu = QMenu(self)
         if item is None:
-            import_action = menu.addAction("Import file")
-            paste_action = menu.addAction("Paste clipboard")
-            selected_action = menu.exec(self.profile_list.viewport().mapToGlobal(pos))
-            if selected_action is import_action:
-                self.import_config()
-            elif selected_action is paste_action:
-                self.import_from_clipboard()
+            if self._profile_source == "subscriptions":
+                view_action = menu.addAction("Открыть подписки")
+                if menu.exec(self.profile_list.viewport().mapToGlobal(pos)) is view_action:
+                    self.show_subscriptions_dialog()
+            else:
+                import_action = menu.addAction("Импортировать конфиг")
+                paste_action = menu.addAction("Вставить из буфера")
+                selected_action = menu.exec(self.profile_list.viewport().mapToGlobal(pos))
+                if selected_action is import_action:
+                    self.import_config()
+                elif selected_action is paste_action:
+                    self.import_from_clipboard()
             return
 
         row = self.profile_list.row(item)
         if row < 0:
             return
         data = item.data(Qt.UserRole)
-        if isinstance(data, tuple) and len(data) == 2 and data[0] == "sub":
-            self._show_sub_header_context_menu(str(data[1]), pos)
-            return
         profile_index = data
         if not isinstance(profile_index, int) or profile_index >= len(self.profiles):
             return
@@ -3134,10 +2999,10 @@ class MainWindow(QMainWindow):
             sub = self.subscription_store.get(profile.subscription_id)
             if sub:
                 update_sub_action = menu.addAction(f'Update subscription "{sub.name}"')
-        rename_action = menu.addAction("Rename")
-        duplicate_action = menu.addAction("Duplicate")
+        rename_action = menu.addAction("Rename") if not profile.subscription_id else None
+        duplicate_action = menu.addAction("Duplicate as my config")
         export_action = menu.addAction("Export")
-        delete_action = menu.addAction(f'Delete "{profile.name}"')
+        delete_action = menu.addAction(f'Delete "{profile.name}"') if not profile.subscription_id else None
         favorite_action = menu.addAction('Remove from favorites' if profile.id in self.favorite_profile_ids
                                          else '★ Add to favorites')
         if self.vpn.status in {"connected", "connecting"} and self.connected_index == profile_index:
@@ -3148,13 +3013,13 @@ class MainWindow(QMainWindow):
         elif update_sub_action and selected_action is update_sub_action:
             if profile.subscription_id:
                 self.update_subscription(profile.subscription_id)
-        elif selected_action is rename_action:
+        elif rename_action and selected_action is rename_action:
             self.rename_selected_profile()
         elif selected_action is duplicate_action:
             self.duplicate_selected_profile()
         elif selected_action is export_action:
             self.export_selected_profile()
-        elif selected_action is delete_action:
+        elif delete_action and selected_action is delete_action:
             self.delete_selected_profile()
         elif selected_action is favorite_action:
             self._toggle_favorite(profile.id)
@@ -3200,8 +3065,6 @@ class MainWindow(QMainWindow):
         return profile_index
 
     def _connect_selected_profile(self) -> None:
-        if self._selected_sub_header() is not None:
-            return  # single click already toggled the group; nothing to connect
         index = self._selected_profile_index()
         if index is None:
             self._show_error("Choose a profile first")
@@ -3216,8 +3079,6 @@ class MainWindow(QMainWindow):
         if best is None:
             if not self.profiles:
                 self._show_error("Choose a profile first")
-            elif self._filters_active() and not self._visible_profile_indices:
-                self._show_error("No profiles match the current filters.")
             else:
                 self._show_error("No latency results yet — press Ping first, then retry.")
             return
@@ -3229,6 +3090,14 @@ class MainWindow(QMainWindow):
             return
 
         index = self._selected_profile_index()
+        if index is None:
+            # The Configs page starts on "My configs"; an account with only
+            # subscription nodes still needs a working Connect button.
+            quick_index = self.quick_profile_combo.currentData()
+            if isinstance(quick_index, int) and 0 <= quick_index < len(self.profiles):
+                index = quick_index
+            elif self.profiles:
+                index = 0
         if self.auto_switch_checkbox.isChecked():
             best = self._best_profile_index()
             if best is not None:
@@ -3333,75 +3202,23 @@ class MainWindow(QMainWindow):
             elif target_index <= self.connected_index < source_index:
                 self.connected_index += 1
 
-    def _group_of(self, profile_index: int) -> str:
-        return self.profiles[profile_index].subscription_id or "__manual__"
-
     def _on_profile_items_reordered(self, old_row: int, new_row: int) -> None:
-        manual_mode = str(self.profile_sort_combo.currentData() or "manual") == "manual"
-        if (
-            not manual_mode
-            or self.profile_search_edit.text().strip()
-            or self._selected_location != "ALL"
-            or self._selected_sub_id
-        ):
+        if (self._profile_source != "manual" or
+                str(self.profile_sort_combo.currentData() or "manual") != "manual" or
+                self.profile_search_edit.text().strip() or self._selected_location != "ALL"):
             self._refresh_profile_views()
             return
-        if self._is_grouped_view():
-            self._reorder_grouped_rows(new_row)
+        if not (0 <= old_row < len(self._visible_profile_indices) and
+                0 <= new_row < len(self._visible_profile_indices)):
+            self._refresh_profile_views()
             return
-        self._move_profile(old_row, new_row)
+        original_idx = self._visible_profile_indices[old_row]
+        target_idx = self._visible_profile_indices[new_row]
+        self._move_profile(original_idx, target_idx)
         self._save_profiles()
         self._refresh_profile_views()
-        self._set_selected_profile_index(new_row)
-        self._append_log("Reordered profiles")
-
-    def _reorder_grouped_rows(self, dropped_row: int) -> None:
-        """Drag-reorder inside one group (manual section or an expanded subscription).
-
-        After an internal move the dragged row sits at ``dropped_row``; the
-        target position is derived from the nearest profile rows around it.
-        Headers cannot move and profiles cannot cross groups: such drops are
-        reverted.
-        """
-        count = self.profile_list.count()
-        if not 0 <= dropped_row < count:
-            self._refresh_profile_views()
-            return
-        dropped_item = self.profile_list.item(dropped_row)
-        source = dropped_item.data(Qt.UserRole) if dropped_item is not None else None
-        if not isinstance(source, int) or not 0 <= source < len(self.profiles):
-            self._refresh_profile_views()
-            return
-
-        def neighbor(step: int) -> int | None:
-            row = dropped_row + step
-            while 0 <= row < count:
-                item = self.profile_list.item(row)
-                data = item.data(Qt.UserRole) if item is not None else None
-                if isinstance(data, int) and 0 <= data < len(self.profiles):
-                    return data
-                row += step
-            return None
-
-        prev_idx, next_idx = neighbor(-1), neighbor(1)
-        group = self._group_of(source)
-        if prev_idx is not None and self._group_of(prev_idx) == group:
-            # Insert right after prev (compensate the pop shift).
-            target = prev_idx - (1 if source < prev_idx else 0) + 1
-        elif next_idx is not None and self._group_of(next_idx) == group:
-            # Insert right before next.
-            target = next_idx - (1 if source < next_idx else 0)
-        else:
-            self._refresh_profile_views()
-            return
-        if target == source:
-            self._refresh_profile_views()
-            return
-        self._move_profile(source, target)
-        self._save_profiles()
-        self._refresh_profile_views()
-        self._set_selected_profile_index(target)
-        self._append_log("Reordered profiles")
+        self._set_selected_profile_index(target_idx)
+        self._append_log("Reordered manually imported configs")
 
     def refresh_latencies(self) -> None:
         if not self.profiles:
@@ -3481,21 +3298,13 @@ class MainWindow(QMainWindow):
         if self._pending_latency_refresh:
             self.refresh_latencies()
 
-    def _filters_active(self) -> bool:
-        return (
-            self._selected_location != "ALL"
-            or bool(self._selected_sub_id)
-            or bool(self.profile_search_edit.text().strip())
-        )
-
     def _best_profile_index(self) -> int | None:
-        candidates = list(self._visible_profile_indices) if self._filters_active() else list(range(len(self.profiles)))
-        if not candidates:
+        """Smart Connect evaluates all nodes independently of the active UI tab."""
+        if not self.profiles:
             return None
-        ids = [self.profiles[i].id for i in candidates]
-        latencies = [self.profile_latencies[i] if i < len(self.profile_latencies) else None for i in candidates]
-        best_in_candidates = self.quality.best(ids, latencies)
-        return candidates[best_in_candidates] if best_in_candidates is not None else None
+        ids = [p.id for p in self.profiles]
+        best = self.quality.best(ids, self.profile_latencies)
+        return best if best is not None else None
 
     def _maybe_auto_switch(self) -> None:
         if not self.auto_switch_checkbox.isChecked() or self.vpn.status != 'connected':
@@ -3706,6 +3515,9 @@ class MainWindow(QMainWindow):
             index = self.connected_index
         else:
             index = self._selected_profile_index()
+            if index is None:
+                quick_index = self.quick_profile_combo.currentData()
+                index = quick_index if isinstance(quick_index, int) else None
         if index is None or index < 0 or index >= len(self.profiles):
             self.vpn_profile_label.setText(f"{len(self.profiles)} profile(s) available")
             return
