@@ -29,9 +29,9 @@ class TrafficChart(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
-        painter.fillRect(self.rect(), QColor('#111b27'))
+        painter.fillRect(self.rect(), QColor('#151f2b'))
         pad = 10
-        painter.setPen(QPen(QColor('#263242'), 1))
+        painter.setPen(QPen(QColor('#293d4c'), 1))
         for j in range(1, 4):
             y = int(h * j / 4)
             painter.drawLine(pad, y, w - pad, y)

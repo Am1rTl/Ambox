@@ -939,7 +939,13 @@ def build_singbox_config(
 
     routing = routing or RoutingOptions()
     mode = routing.mode if routing.mode in {"all", "only_selected", "all_except_selected"} else "all"
+    app_mode = routing.app_mode if routing.app_mode in {"disabled", "proxy_selected", "direct_selected"} else "disabled"
     dns_mode = routing.dns_mode if routing.dns_mode in {"proxy", "direct", "custom"} else "proxy"
+    if app_mode == "proxy_selected":
+        # DNS from systemd-resolved and similar shared resolvers has no usable
+        # originating app identity. Avoid tunnelling every app's DNS in this
+        # mode; the UI explicitly warns about the shared system resolver.
+        dns_mode = "direct"
     custom_dns = routing.custom_dns.strip()
     domains: list[str] = []
     ip_cidrs: list[str] = []
@@ -1076,54 +1082,56 @@ def build_singbox_config(
     if server_ips:
         rules.append({"ip_cidr": sorted(server_ips), "outbound": "direct"})
 
-    app_mode = routing.app_mode if routing.app_mode in {"disabled", "proxy_selected", "direct_selected"} else "disabled"
+    udp_ok = bundle is not None or _supports_udp(proxy_outbounds[0])
     if app_mode != "disabled":
         process_names = sorted({str(value).strip() for value in routing.app_process_names if str(value).strip()})
         process_paths = sorted({str(value).strip() for value in routing.app_process_paths if str(value).strip()})
-        app_outbound = proxy_tag if app_mode == "proxy_selected" else "direct"
-        # Keep name and path in separate rules.  A sing-box route rule combines
-        # fields, while the UI treats a selected executable as name OR path.
-        if process_names:
-            rules.append({"process_name": process_names, "outbound": app_outbound})
-        if process_paths:
-            rules.append({"process_path": process_paths, "outbound": app_outbound})
+        selected_outbound = proxy_tag if app_mode == "proxy_selected" else "direct"
+        # App routing is an exclusive, predictable mode; stale domain presets
+        # and provider rules must not cause unrelated apps to use the VPN.
+        final_outbound = "direct" if app_mode == "proxy_selected" else proxy_tag
+        for key, values in (("process_name", process_names), ("process_path", process_paths)):
+            if values:
+                if app_mode == "proxy_selected" and not udp_ok:
+                    rules.append({key: values, "network": ["udp"], "outbound": "block"})
+                rules.append({key: values, "outbound": selected_outbound})
+        if app_mode == "proxy_selected" and mode == "all_except_selected":
+            # Retain harmless explicit DIRECT exceptions for backward compatibility.
+            # App selectors still take priority; the fallback stays DIRECT.
+            if domains:
+                rules.append({rule_key: domains, "outbound": "direct"})
+            if ip_cidrs:
+                rules.append({"ip_cidr": ip_cidrs, "outbound": "direct"})
+    else:
+        if routing.ignore_ru_domains:
+            rules.append({"domain_suffix": [RU_DOMAIN_SUFFIX], "outbound": "direct"})
+            if dns_mode == "proxy" and dns_config is not None:
+                dns_config["rules"] = [
+                    {"domain_suffix": [RU_DOMAIN_SUFFIX], "action": "route", "server": "direct-dns"}
+                ]
 
-    if routing.ignore_ru_domains:
-        rules.append({"domain_suffix": [RU_DOMAIN_SUFFIX], "outbound": "direct"})
-        if dns_mode == "proxy" and dns_config is not None:
-            dns_config["rules"] = [
-                {"domain_suffix": [RU_DOMAIN_SUFFIX], "action": "route", "server": "direct-dns"}
-            ]
+        if mode == "only_selected":
+            final_outbound = "direct"
+            targets = ((rule_key, domains), ("ip_cidr", ip_cidrs))
+            for target_key, target_values in targets:
+                if not target_values:
+                    continue
+                if udp_ok:
+                    rules.append({target_key: target_values, "outbound": proxy_tag})
+                else:
+                    rules.append({target_key: target_values, "network": ["udp"], "outbound": "block"})
+                    rules.append({target_key: target_values, "outbound": proxy_tag})
+        elif mode == "all_except_selected":
+            if domains:
+                rules.append({rule_key: domains, "outbound": "direct"})
+            if ip_cidrs:
+                rules.append({"ip_cidr": ip_cidrs, "outbound": "direct"})
 
-    udp_ok = bundle is not None or _supports_udp(proxy_outbounds[0])
-    if mode == "only_selected":
-        final_outbound = "direct"
-        targets = ((rule_key, domains), ("ip_cidr", ip_cidrs))
-        for target_key, target_values in targets:
-            if not target_values:
-                continue
-            if udp_ok:
-                rules.append({target_key: target_values, "outbound": proxy_tag})
-            else:
-                # TCP-only proxies cannot carry UDP. Keep non-selected traffic direct and
-                # explicitly reject selected-domain UDP to avoid ambiguous fallback behavior.
-                rules.append({target_key: target_values, "network": ["udp"], "outbound": "block"})
-                rules.append({target_key: target_values, "outbound": proxy_tag})
-    elif mode == "all_except_selected":
-        if domains:
-            rules.append({rule_key: domains, "outbound": "direct"})
-        if ip_cidrs:
-            rules.append({"ip_cidr": ip_cidrs, "outbound": "direct"})
+        if bundle is not None and mode != "only_selected":
+            rules.extend(bundle.rules)
 
-    if bundle is not None and mode != "only_selected":
-        # The provider's own routing (per-service nodes, balancers, direct lists) comes after the
-        # user's exceptions above.
-        rules.extend(bundle.rules)
-
-    if not udp_ok and mode in {"all", "all_except_selected"}:
-        # Prevent endless UDP retry errors for TCP-only links (e.g. QUIC traffic).
-        # This rule is intentionally placed after domain exceptions above.
-        rules.append({"network": ["udp"], "outbound": "block"})
+        if not udp_ok and mode in {"all", "all_except_selected"}:
+            rules.append({"network": ["udp"], "outbound": "block"})
 
     config: dict[str, Any] = {
         "log": {"level": "info", "timestamp": True},
@@ -1151,7 +1159,7 @@ def build_singbox_config(
     if routing.auto_redirect:
         # This feature is opt-in: Linux host must provide nftables support.
         config['inbounds'][0]['auto_redirect'] = True
-    if bundle is not None and mode != "only_selected" and bundle.rule_sets:
+    if bundle is not None and app_mode == "disabled" and mode != "only_selected" and bundle.rule_sets:
         config["route"]["rule_set"] = [
             {"type": "local", "tag": tag, "format": "binary", "path": str(rule_set_path(kind, name))}
             for tag, (kind, name) in sorted(bundle.rule_sets.items())
