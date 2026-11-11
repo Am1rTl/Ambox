@@ -1,461 +1,383 @@
+"""Compact, in-window subscription management for ambox.
+
+The panel manages subscription *sources*, never manual profile imports. A source's
+nodes are opened in the separate Configs screen. Network requests remain in
+MainWindow's bounded worker pool; this module only handles presentation.
+"""
 from __future__ import annotations
 
 import re
 import time
 from typing import TYPE_CHECKING
-from PySide6.QtCore import QSize, Qt, Signal
+
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QDialog,
     QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
-from app.subscriptions import Subscription, SubscriptionStore, format_bytes
+from app.subscriptions import Subscription, format_bytes, valid_subscription_link
 
 if TYPE_CHECKING:
     from app.main_window import MainWindow
 
 
-class SubscriptionCard(QWidget):
-    """Compact one-row subscription card: name, status, traffic bar, remaining."""
+class AddSubscriptionDialog(QDialog):
+    """Small explicit form. Prefilling from clipboard requires a button click."""
 
+    def __init__(self, parent: QWidget, subscription: Subscription | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Изменить подписку" if subscription else "Добавить подписку")
+        self.setMinimumWidth(350)
+        self.resize(430, 215)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 16)
+        layout.setSpacing(10)
+        title = QLabel("Изменить ссылку" if subscription else "Новая подписка")
+        title.setObjectName("sectionTitle")
+        layout.addWidget(title)
+        hint = QLabel("Happ или URL подписки. Серверы появятся в разделе «Конфиги». ")
+        hint.setObjectName("softHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        row = QHBoxLayout()
+        self.url_edit = QLineEdit()
+        self.url_edit.setObjectName("subscriptionUrl")
+        self.url_edit.setPlaceholderText("https://provider.example/subscription/…")
+        self.url_edit.setText((subscription.original_link or subscription.url) if subscription else "")
+        self.url_edit.setToolTip("Ссылка может содержать токен доступа — не публикуйте её")
+        row.addWidget(self.url_edit, 1)
+        paste = QPushButton("Вставить")
+        paste.clicked.connect(self._paste)
+        row.addWidget(paste)
+        layout.addLayout(row)
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("Название (необязательно)")
+        self.name_edit.setText(subscription.name if subscription else "")
+        if subscription:
+            self.name_edit.hide()
+        else:
+            layout.addWidget(self.name_edit)
+        self.error = QLabel("")
+        self.error.setStyleSheet("color: #ff9999; font-size: 11px;")
+        self.error.setWordWrap(True)
+        self.error.hide()
+        layout.addWidget(self.error)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        cancel = QPushButton("Отмена")
+        cancel.clicked.connect(self.reject)
+        actions.addWidget(cancel)
+        self.submit_btn = QPushButton("Сохранить" if subscription else "Добавить")
+        self.submit_btn.setObjectName("primaryAction")
+        self.submit_btn.setDefault(True)
+        self.submit_btn.clicked.connect(self._validate)
+        actions.addWidget(self.submit_btn)
+        layout.addLayout(actions)
+        self.url_edit.returnPressed.connect(self._validate)
+        self.url_edit.setFocus()
+
+    def _paste(self) -> None:
+        clipboard = QApplication.clipboard().text().strip()
+        match = re.search(r"(happ://[^\s\"<>]+|https?://[^\s\"<>]+)", clipboard)
+        if match:
+            self.url_edit.setText(match.group(1).rstrip("\"';,.<>"))
+        else:
+            self.error.setText("Буфер обмена не содержит ссылку на подписку")
+            self.error.show()
+
+    def _validate(self) -> None:
+        if not valid_subscription_link(self.url_edit.text()):
+            self.error.setText("Введите корректную ссылку Happ, HTTPS или HTTP")
+            self.error.show()
+            self.url_edit.setFocus()
+            return
+        self.accept()
+
+    @property
+    def link(self) -> str:
+        return self.url_edit.text().strip()
+
+    @property
+    def name(self) -> str:
+        return self.name_edit.text().strip()
+
+
+class SubscriptionCard(QFrame):
+    """One source, one primary action and one overflow menu."""
+
+    show_nodes = Signal(str)
     update_requested = Signal(str)
-    auto_update_changed = Signal(str, bool)
     rename_requested = Signal(str)
+    link_requested = Signal(str)
     delete_requested = Signal(str)
+    auto_update_changed = Signal(str, bool)
 
     def __init__(self, sub: Subscription, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.sub_id = sub.id
+        self.sub = sub
+        self.setObjectName("subscriptionCard")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        body = QVBoxLayout(self)
+        body.setContentsMargins(12, 11, 12, 11)
+        body.setSpacing(7)
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(8, 6, 8, 6)
-        outer.setSpacing(4)
-
-        top_row = QHBoxLayout()
-        top_row.setContentsMargins(0, 0, 0, 0)
-        top_row.setSpacing(8)
+        top = QHBoxLayout()
+        top.setSpacing(7)
+        name = QLabel(sub.name)
+        name.setObjectName("subscriptionName")
+        name.setTextFormat(Qt.PlainText)
+        name.setMinimumWidth(0)
+        name.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        name.setToolTip(sub.name)
+        top.addWidget(name, 1)
+        count = QLabel(f"{sub.profile_count} серверов")
+        count.setObjectName("softHint")
+        top.addWidget(count)
+        body.addLayout(top)
 
         stats = sub.traffic_stats()
-        name = QLabel(f"📌 {sub.name}")
-        name.setStyleSheet("font-weight: 700; color: #f0f1f5; font-size: 13px;")
-        name.setToolTip(sub.name)
-        # Long names must shrink (clip) instead of pushing the buttons out.
-        name.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        top_row.addWidget(name, 1)
+        details = []
+        if stats.has_data:
+            if stats.unlimited:
+                details.append("Безлимит" if stats.used <= 0 else f"Использовано {format_bytes(stats.used)}")
+            elif stats.total is not None:
+                details.append(f"Осталось {format_bytes(stats.remaining)} из {format_bytes(stats.total)}")
+            if stats.expire_str:
+                details.append(f"До {stats.expire_str}")
+        if not details:
+            details.append("Информация о трафике недоступна")
+        summary = QLabel(" · ".join(details))
+        summary.setObjectName("softHint")
+        summary.setTextFormat(Qt.PlainText)
+        summary.setWordWrap(True)
+        body.addWidget(summary)
+        if stats.has_data and not stats.unlimited:
+            progress = QProgressBar()
+            progress.setTextVisible(False)
+            progress.setRange(0, 100)
+            progress.setValue(round(stats.percent))
+            progress.setFixedHeight(5)
+            progress.setObjectName("subscriptionProgress")
+            if stats.percent >= 90:
+                progress.setProperty("quota", "critical")
+            progress.setToolTip(f"Использовано {format_bytes(stats.used)}")
+            body.addWidget(progress)
 
-        button_style = (
-            "QPushButton { background-color: #22293a; border: 1px solid #3d475f;"
-            " border-radius: 6px; padding: 2px 10px; color: #dfe3ec; font-size: 11px; }"
-            "QPushButton:hover { background-color: #2c3550; border-color: #f3b66a; }"
-        )
-        delete_style = button_style.replace("#dfe3ec", "#ff8a8a")
-        for label, tip, signal, style in (
-            ("Update", "Update this subscription now", self.update_requested, button_style),
-            ("Rename", "Rename this subscription", self.rename_requested, button_style),
-            ("Delete", "Delete this subscription and its profiles", self.delete_requested, delete_style),
-        ):
-            btn = QPushButton(label)
-            btn.setFixedHeight(24)
-            btn.setStyleSheet(style)
-            btn.setToolTip(tip)
-            btn.clicked.connect(lambda _checked=False, s=signal: s.emit(self.sub_id))
-            top_row.addWidget(btn)
-        auto_check = QCheckBox('Auto')
-        auto_check.setChecked(sub.auto_update)
-        auto_check.setToolTip('Allow scheduled updates; manual update remains available')
-        auto_check.toggled.connect(lambda checked: self.auto_update_changed.emit(self.sub_id, checked))
-        top_row.addWidget(auto_check)
-        outer.addLayout(top_row)
+        bottom = QHBoxLayout()
+        bottom.setSpacing(8)
+        self.activity = QLabel(self._last_updated())
+        self.activity.setObjectName("softHint")
+        self.activity.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        bottom.addWidget(self.activity, 1)
+        nodes_btn = QPushButton("Серверы")
+        nodes_btn.setToolTip("Открыть серверы этой подписки")
+        nodes_btn.clicked.connect(lambda: self.show_nodes.emit(sub.id))
+        bottom.addWidget(nodes_btn)
+        self.update_btn = QPushButton("Обновить")
+        self.update_btn.clicked.connect(lambda: self.update_requested.emit(sub.id))
+        bottom.addWidget(self.update_btn)
+        more_btn = QPushButton("⋯")
+        more_btn.setFixedWidth(30)
+        more_btn.setToolTip("Дополнительные действия")
+        more_btn.clicked.connect(lambda: self._show_menu(more_btn))
+        bottom.addWidget(more_btn)
+        body.addLayout(bottom)
 
-        bottom_row = QHBoxLayout()
-        bottom_row.setContentsMargins(0, 0, 0, 0)
-        bottom_row.setSpacing(8)
+    def _last_updated(self) -> str:
+        if self.sub.updated_at <= 0:
+            return "Ещё не обновлялась"
+        return "Обновлено " + time.strftime("%d.%m %H:%M", time.localtime(self.sub.updated_at))
 
-        status_bits = [f"{sub.profile_count} nodes"]
-        if stats.expire_str:
-            status_bits.append(f"till {stats.expire_str}")
-        status = QLabel(" · ".join(status_bits))
-        status.setStyleSheet("color: #8f95a3; font-size: 11px;")
-        status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        bottom_row.addWidget(status, 1)
+    def set_activity(self, message: str = "", *, busy: bool = False, error: bool = False) -> None:
+        self.activity.setText(message or self._last_updated())
+        self.activity.setStyleSheet("color: #ff9999;" if error else "")
+        self.update_btn.setText("Обновление…" if busy else "Обновить")
+        self.update_btn.setEnabled(not busy)
 
-        if not stats.has_data:
-            remaining_text = "No data"
-            bar_tip = "No traffic info from provider"
-            bar_value = 0
-            chunk_color = "#3a4152"
-        elif stats.unlimited:
-            remaining_text = "∞ Unlimited"
-            bar_tip = f"Used {format_bytes(stats.used)}, unlimited plan"
-            bar_value = 100
-            chunk_color = "#5aa86b"
-        elif stats.over_quota:
-            remaining_text = "Over quota"
-            bar_tip = f"Used {format_bytes(stats.used)} of {format_bytes(stats.total)} — over quota"
-            bar_value = 100
-            chunk_color = "#e05252"
-        else:
-            assert stats.remaining is not None and stats.total is not None
-            remaining_text = f"{format_bytes(stats.remaining)} left"
-            bar_tip = f"Used {format_bytes(stats.used)} of {format_bytes(stats.total)}"
-            bar_value = int(round(stats.percent))
-            chunk_color = (
-                "#e05252"
-                if stats.percent >= 90
-                else ("#e0a34e" if stats.percent >= 70 else "#5aa86b")
-            )
-
-        bar = QProgressBar()
-        bar.setRange(0, 100)
-        bar.setValue(bar_value)
-        bar.setTextVisible(False)
-        bar.setFixedWidth(140)
-        bar.setFixedHeight(10)
-        bar.setToolTip(bar_tip)
-        bar.setStyleSheet(
-            "QProgressBar { background: #121622; border: 1px solid #2d3340; border-radius: 5px; }"
-            f"QProgressBar::chunk {{ background: {chunk_color}; border-radius: 4px; }}"
-        )
-        bottom_row.addWidget(bar)
-
-        remaining = QLabel(remaining_text)
-        remaining.setStyleSheet(
-            "color: #ff8a8a; font-size: 11px; font-weight: 600;"
-            if stats.over_quota
-            else "color: #b9c0cf; font-size: 11px;"
-        )
-        remaining.setToolTip(bar_tip)
-        bottom_row.addWidget(remaining)
-        outer.addLayout(bottom_row)
-
-        updated = (
-            time.strftime("Updated: %Y-%m-%d %H:%M", time.localtime(sub.updated_at))
-            if sub.updated_at > 0
-            else ""
-        )
-        tip_lines = [
-            sub.name,
-            f"URL: {sub.original_link or sub.url}",
-            f"Nodes: {sub.profile_count}",
-            sub.userinfo_summary() or "No traffic info",
-        ]
-        if updated:
-            tip_lines.append(updated)
-        self.setToolTip("\n".join(tip_lines))
-
-    def sizeHint(self) -> QSize:
-        return QSize(400, 68)
+    def _show_menu(self, anchor: QPushButton) -> None:
+        menu = QMenu(self)
+        rename = menu.addAction("Переименовать")
+        edit = menu.addAction("Изменить ссылку")
+        auto = menu.addAction("Автообновление")
+        auto.setCheckable(True)
+        auto.setChecked(self.sub.auto_update)
+        menu.addSeparator()
+        delete = menu.addAction("Удалить подписку…")
+        chosen = menu.exec(anchor.mapToGlobal(anchor.rect().bottomLeft()))
+        if chosen is rename:
+            self.rename_requested.emit(self.sub.id)
+        elif chosen is edit:
+            self.link_requested.emit(self.sub.id)
+        elif chosen is auto:
+            self.auto_update_changed.emit(self.sub.id, auto.isChecked())
+        elif chosen is delete:
+            self.delete_requested.emit(self.sub.id)
 
 
-class SubscriptionsDialog(QDialog):
+class SubscriptionsPanel(QWidget):
+    """An always-visible page, not a modal nested under a second window."""
+
     update_single_signal = Signal(str)
     update_all_signal = Signal()
     add_subscription_signal = Signal(str, str)
+    edit_subscription_link_signal = Signal(str, str)
     delete_subscription_signal = Signal(str)
+    nodes_requested = Signal(str)
 
     def __init__(self, parent: MainWindow) -> None:
         super().__init__(parent)
         self.main_window = parent
-        self.setWindowTitle("Manage Subscriptions")
-        self.resize(560, 480)
-        self.setMinimumSize(460, 360)
-        self._build_ui()
+        self._cards: dict[str, SubscriptionCard] = {}
+        self._states: dict[str, tuple[str, bool, bool]] = {}
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(10)
+
+        head = QHBoxLayout()
+        title = QLabel("Подписки")
+        title.setObjectName("sectionTitle")
+        head.addWidget(title)
+        head.addStretch(1)
+        self.add_btn = QPushButton("+ Добавить")
+        self.add_btn.setObjectName("primaryAction")
+        self.add_btn.clicked.connect(self.open_add_dialog)
+        head.addWidget(self.add_btn)
+        root.addLayout(head)
+        tip = QLabel("Добавляйте и обновляйте источники здесь. Их серверы отдельно находятся в «Конфигах».")
+        tip.setObjectName("softHint")
+        tip.setWordWrap(True)
+        root.addWidget(tip)
+        self.feedback = QLabel("")
+        self.feedback.setObjectName("softHint")
+        self.feedback.setWordWrap(True)
+        self.feedback.hide()
+        root.addWidget(self.feedback)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        host = QWidget()
+        self.cards_layout = QVBoxLayout(host)
+        self.cards_layout.setContentsMargins(0, 2, 0, 2)
+        self.cards_layout.setSpacing(9)
+        self.empty = QLabel("Подписок пока нет.\nНажмите «Добавить», чтобы импортировать первую.")
+        self.empty.setAlignment(Qt.AlignCenter)
+        self.empty.setObjectName("emptyState")
+        self.empty.setWordWrap(True)
+        self.cards_layout.addWidget(self.empty)
+        self.cards_layout.addStretch(1)
+        self.scroll.setWidget(host)
+        root.addWidget(self.scroll, 1)
+        foot = QHBoxLayout()
+        self.counter = QLabel("0 подписок")
+        self.counter.setObjectName("softHint")
+        foot.addWidget(self.counter, 1)
+        self.refresh_btn = QPushButton("Обновить все")
+        self.refresh_btn.clicked.connect(lambda: self.update_all_signal.emit())
+        foot.addWidget(self.refresh_btn)
+        root.addLayout(foot)
         self.refresh_list()
 
-    def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+    def set_feedback(self, message: str, *, error: bool = False) -> None:
+        self.feedback.setText(message)
+        self.feedback.setStyleSheet("color: #ff9999;" if error else "")
+        self.feedback.setVisible(bool(message))
 
-        self.header_label = QLabel("Active Subscriptions")
-        self.header_label.setStyleSheet("font-size: 16px; font-weight: 700; color: #f0f1f5;")
-        layout.addWidget(self.header_label)
-
-        hint = QLabel("Subscriptions automatically synchronize and manage their VPN profiles.")
-        hint.setStyleSheet("color: #8f95a3; font-size: 12px;")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        self.list_widget = QListWidget()
-        self.list_widget.setStyleSheet(
-            """
-            QListWidget {
-                background-color: #121622;
-                border: 1px solid #2d3340;
-                border-radius: 8px;
-                padding: 6px;
-            }
-            QListWidget::item {
-                background-color: #191e2b;
-                border: 1px solid #2d3445;
-                border-radius: 8px;
-                margin-bottom: 6px;
-                padding: 0px;
-            }
-            QListWidget::item:hover {
-                background-color: #22293a;
-                border: 1px solid #3d475f;
-            }
-            QListWidget::item:selected {
-                background-color: #283147;
-                border: 1px solid #f3b66a;
-            }
-            """
-        )
-        layout.addWidget(self.list_widget, 1)
-
-        self.empty_label = QLabel(
-            "No subscriptions yet.\nPaste a Happ link or HTTPS subscription URL via “Add subscription”."
-        )
-        self.empty_label.setStyleSheet("color: #8f95a3; font-size: 13px; padding: 24px;")
-        self.empty_label.setAlignment(Qt.AlignCenter)
-        self.empty_label.setWordWrap(True)
-        self.empty_label.setVisible(False)
-        layout.addWidget(self.empty_label, 1)
-
-        # Buttons under list
-        sub_actions_layout = QHBoxLayout()
-        sub_actions_layout.setSpacing(8)
-
-        self.update_btn = QPushButton("🔄 Update selected")
-        self.update_btn.setStyleSheet("font-weight: 600; padding: 6px 12px;")
-        self.update_btn.clicked.connect(self._on_update_selected)
-
-        self.rename_btn = QPushButton("✏️ Rename")
-        self.rename_btn.setStyleSheet("font-weight: 600; padding: 6px 12px;")
-        self.rename_btn.clicked.connect(self._on_rename)
-
-        self.delete_btn = QPushButton("🗑️ Delete")
-        self.delete_btn.setStyleSheet("font-weight: 600; padding: 6px 12px; color: #ff8a8a;")
-        self.delete_btn.clicked.connect(self._on_delete)
-
-        sub_actions_layout.addWidget(self.update_btn)
-        sub_actions_layout.addWidget(self.rename_btn)
-        sub_actions_layout.addWidget(self.delete_btn)
-        layout.addLayout(sub_actions_layout)
-
-        # Bottom buttons
-        bottom_layout = QHBoxLayout()
-        bottom_layout.setSpacing(10)
-
-        self.add_btn = QPushButton("➕ Add subscription")
-        self.add_btn.setStyleSheet(
-            """
-            QPushButton {
-                background-color: #2d3a54;
-                border: 1px solid #4a5c82;
-                color: #ffffff;
-                font-weight: 700;
-                padding: 8px 16px;
-                border-radius: 8px;
-            }
-            QPushButton:hover {
-                background-color: #3b4c6e;
-            }
-            """
-        )
-        self.add_btn.clicked.connect(self._on_add)
-
-        self.update_all_btn = QPushButton("🔄 Update all")
-        self.update_all_btn.setStyleSheet(
-            """
-            QPushButton {
-                background-color: #383020;
-                border: 1px solid #6b5735;
-                color: #f7ca88;
-                font-weight: 700;
-                padding: 8px 16px;
-                border-radius: 8px;
-            }
-            QPushButton:hover {
-                background-color: #4a3f2b;
-            }
-            """
-        )
-        self.update_all_btn.clicked.connect(self._on_update_all)
-
-        close_btn = QPushButton("Close")
-        close_btn.setStyleSheet("padding: 8px 16px; font-weight: 600;")
-        close_btn.clicked.connect(self.accept)
-
-        bottom_layout.addWidget(self.add_btn)
-        bottom_layout.addWidget(self.update_all_btn)
-        bottom_layout.addStretch(1)
-        bottom_layout.addWidget(close_btn)
-        layout.addLayout(bottom_layout)
+    def set_update_state(self, sub_id: str, message: str = "", *, busy: bool = False, error: bool = False) -> None:
+        if message:
+            self._states[sub_id] = (message, busy, error)
+        else:
+            self._states.pop(sub_id, None)
+        card = self._cards.get(sub_id)
+        if card:
+            card.set_activity(message, busy=busy, error=error)
 
     def refresh_list(self) -> None:
-        self.list_widget.clear()
         subs = self.main_window.subscription_store.all()
-        total_nodes = sum(sub.profile_count for sub in subs)
-        self.header_label.setText(f"Active Subscriptions ({len(subs)} · {total_nodes} nodes)")
-        if not subs:
-            self.list_widget.setVisible(False)
-            self.empty_label.setVisible(True)
-            self.update_btn.setEnabled(False)
-            self.rename_btn.setEnabled(False)
-            self.delete_btn.setEnabled(False)
-            self.update_all_btn.setEnabled(False)
-            return
+        for card in self._cards.values():
+            self.cards_layout.removeWidget(card)
+            card.deleteLater()
+        self._cards.clear()
+        self.empty.setVisible(not subs)
+        self.refresh_btn.setEnabled(bool(subs))
+        self.counter.setText(f"{len(subs)} подписок")
+        for index, sub in enumerate(subs):
+            card = SubscriptionCard(sub, self)
+            card.show_nodes.connect(self.nodes_requested)
+            card.update_requested.connect(self._on_update)
+            card.rename_requested.connect(self._on_rename)
+            card.link_requested.connect(self._on_edit_link)
+            card.delete_requested.connect(self._on_delete)
+            card.auto_update_changed.connect(self._on_auto_update)
+            self.cards_layout.insertWidget(index, card)
+            self._cards[sub.id] = card
+            state = self._states.get(sub.id)
+            if state:
+                card.set_activity(state[0], busy=state[1], error=state[2])
+        for sub_id in list(self._states):
+            if not any(sub.id == sub_id for sub in subs):
+                self._states.pop(sub_id, None)
 
-        self.list_widget.setVisible(True)
-        self.empty_label.setVisible(False)
-        self.update_btn.setEnabled(True)
-        self.rename_btn.setEnabled(True)
-        self.delete_btn.setEnabled(True)
-        self.update_all_btn.setEnabled(True)
+    def open_add_dialog(self) -> None:
+        dialog = AddSubscriptionDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            self.set_feedback("Добавление подписки…")
+            self.add_subscription_signal.emit(dialog.link, dialog.name)
 
-        for sub in subs:
-            card = SubscriptionCard(sub)
-            card.update_requested.connect(self._on_card_update)
-            card.rename_requested.connect(self._on_card_rename)
-            card.delete_requested.connect(self._on_card_delete)
-            card.auto_update_changed.connect(self._on_card_auto_update)
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, sub.id)
-            item.setSizeHint(card.sizeHint())
-            self.list_widget.addItem(item)
-            self.list_widget.setItemWidget(item, card)
+    def _on_update(self, sub_id: str) -> None:
+        self.update_single_signal.emit(sub_id)
 
-        if self.list_widget.count() > 0:
-            self.list_widget.setCurrentRow(0)
-
-    def _select_sub_id(self, sub_id: str) -> None:
-        for row in range(self.list_widget.count()):
-            item = self.list_widget.item(row)
-            if item is not None and item.data(Qt.UserRole) == sub_id:
-                self.list_widget.setCurrentRow(row)
-                return
-
-    def _on_card_update(self, sub_id: str) -> None:
-        self._select_sub_id(sub_id)
-        self._on_update_selected()
-
-    def _on_card_rename(self, sub_id: str) -> None:
-        self._select_sub_id(sub_id)
-        self._on_rename()
-
-    def _on_card_delete(self, sub_id: str) -> None:
-        self._select_sub_id(sub_id)
-        self._on_delete()
-
-    def _on_card_auto_update(self, sub_id: str, enabled: bool) -> None:
-        sub = self.main_window.subscription_store.get(sub_id)
-        if sub is not None:
-            sub.auto_update = enabled
-            self.main_window.subscription_store.put(sub)
-
-    def _selected_sub_id(self) -> str | None:
-        item = self.list_widget.currentItem()
-        if not item:
-            return None
-        sub_id = item.data(Qt.UserRole)
-        return str(sub_id) if sub_id else None
-
-    def _on_update_selected(self) -> None:
-        sub_id = self._selected_sub_id()
-        if sub_id:
-            self.update_single_signal.emit(sub_id)
-
-    def _on_update_all(self) -> None:
-        self.update_all_signal.emit()
-
-    def _on_rename(self) -> None:
-        sub_id = self._selected_sub_id()
-        if not sub_id:
-            return
+    def _on_rename(self, sub_id: str) -> None:
         sub = self.main_window.subscription_store.get(sub_id)
         if not sub:
             return
-        new_name, ok = QInputDialog.getText(self, "Rename subscription", "Subscription name:", text=sub.name)
-        if ok and new_name.strip():
-            sub.name = new_name.strip()
+        name, ok = QInputDialog.getText(self, "Переименовать", "Название подписки:", text=sub.name)
+        if ok and name.strip():
+            sub.name = name.strip()
             self.main_window.subscription_store.put(sub)
             self.refresh_list()
             self.main_window._refresh_profile_views()
 
-    def _on_delete(self) -> None:
-        sub_id = self._selected_sub_id()
-        if not sub_id:
-            return
+    def _on_edit_link(self, sub_id: str) -> None:
         sub = self.main_window.subscription_store.get(sub_id)
         if not sub:
             return
-        res = QMessageBox.question(
-            self,
-            "Delete subscription",
-            f'Delete subscription "{sub.name}" and remove all its profiles?',
-            QMessageBox.Yes | QMessageBox.Cancel,
-            QMessageBox.Cancel,
-        )
-        if res == QMessageBox.Yes:
-            self.delete_subscription_signal.emit(sub_id)
+        dialog = AddSubscriptionDialog(self, subscription=sub)
+        if dialog.exec() == QDialog.Accepted and dialog.link != (sub.original_link or sub.url):
+            self.edit_subscription_link_signal.emit(sub_id, dialog.link)
+
+    def _on_auto_update(self, sub_id: str, enabled: bool) -> None:
+        sub = self.main_window.subscription_store.get(sub_id)
+        if sub:
+            sub.auto_update = enabled
+            self.main_window.subscription_store.put(sub)
             self.refresh_list()
 
-    def _on_add(self) -> None:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Add Subscription")
-        dialog.resize(440, 200)
-
-        diag_layout = QVBoxLayout(dialog)
-        diag_layout.setSpacing(10)
-
-        lbl = QLabel("Enter Happ link or HTTPS subscription URL:")
-        lbl.setStyleSheet("font-weight: 600;")
-        diag_layout.addWidget(lbl)
-
-        url_edit = QLineEdit()
-        url_edit.setPlaceholderText("happ://add/https://... or https://example.com/sub?token=...")
-        try:
-            clip_text = QApplication.clipboard().text().strip()
-        except RuntimeError:
-            clip_text = ""
-        if clip_text:
-            clip_match = re.search(r"(happ://[^\s\"<>]+|https?://[^\s\"<>]+)", clip_text)
-            if clip_match:
-                url_edit.setText(clip_match.group(1).rstrip("\"';,.<>"))
-        diag_layout.addWidget(url_edit)
-
-        name_lbl = QLabel("Custom name (optional):")
-        name_lbl.setStyleSheet("color: #8f95a3; font-size: 12px;")
-        diag_layout.addWidget(name_lbl)
-
-        name_edit = QLineEdit()
-        name_edit.setPlaceholderText("My Provider")
-        diag_layout.addWidget(name_edit)
-
-        btn_row = QHBoxLayout()
-        btn_row.addStretch(1)
-        ok_btn = QPushButton("Add & Import")
-        ok_btn.setStyleSheet("font-weight: 700; padding: 6px 14px;")
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(dialog.reject)
-        btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(ok_btn)
-        diag_layout.addLayout(btn_row)
-
-        def handle_ok():
-            url = url_edit.text().strip()
-            if not url:
-                QMessageBox.warning(dialog, "Input error", "URL / Link cannot be empty")
-                return
-            dialog.accept()
-            self.add_subscription_signal.emit(url, name_edit.text().strip())
-
-        ok_btn.clicked.connect(handle_ok)
-        dialog.exec()
+    def _on_delete(self, sub_id: str) -> None:
+        sub = self.main_window.subscription_store.get(sub_id)
+        if not sub:
+            return
+        answer = QMessageBox.question(
+            self, "Удаление подписки",
+            f"Удалить «{sub.name}» и {sub.profile_count} её серверов?\n"
+            "Конфиги, добавленные вручную, не будут затронуты.",
+            QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
+        )
+        if answer == QMessageBox.Yes:
+            self.delete_subscription_signal.emit(sub_id)
+            self.refresh_list()

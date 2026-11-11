@@ -161,6 +161,15 @@ def format_bytes(value: Any) -> str:
     return f"{size:.1f} {unit}"
 
 
+def valid_subscription_link(link: str) -> bool:
+    """Reject plain config text and malformed URLs before scheduling a fetch."""
+    value = link.strip()
+    if is_happ_link(value):
+        return len(value) > len("happ://")
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+
+
 def generate_subscription_id(url: str) -> str:
     cleaned = url.strip().lower()
     return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
