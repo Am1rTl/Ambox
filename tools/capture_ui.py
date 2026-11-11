@@ -66,8 +66,13 @@ def render(output: Path) -> None:
                     window._set_bottom_page(page)
                     app.processEvents()
                     file = output / f'{name}_{size[0]}x{size[1]}.png'
-                    if not window.grab().save(str(file)):
+                    shot = window.grab()
+                    if not shot.save(str(file)):
                         raise RuntimeError(f'Screenshot failed: {file}')
+                    # Theme regressions used to show giant white blocks on tall windows.
+                    if name in ('vpn', 'subscriptions') and size[1] >= 690:
+                        pixel = shot.toImage().pixelColor(size[0] // 2, size[1] - 86)
+                        assert pixel.lightness() < 80, (name, size, pixel.name())
                     # A screenshot alone can hide clipping: fail CI on bad footer geometry.
                     nav_rect = window.bottom_nav.geometry()
                     assert window.bottom_nav.height() == 44, (name, size, nav_rect)

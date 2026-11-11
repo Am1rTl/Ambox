@@ -320,6 +320,8 @@ class MainWindow(QMainWindow):
         phone_layout.addWidget(self.content_stack, 1)
 
         connect_tab = QWidget()
+        connect_tab.setObjectName('overviewBody')
+        connect_tab.setAttribute(Qt.WA_StyledBackground, True)
         connect_layout = QVBoxLayout(connect_tab)
         connect_layout.setContentsMargins(3, 3, 3, 3)
         connect_layout.setSpacing(8)
@@ -880,7 +882,7 @@ class MainWindow(QMainWindow):
         self.app_warning.setObjectName('softHint')
         self.app_warning.setWordWrap(True)
         hint_layout.addWidget(self.app_warning)
-        self.app_help_btn = QPushButton('ⓘ  Как определяется приложение?')
+        self.app_help_btn = QPushButton('Как работают правила приложений?')
         self.app_help_btn.setObjectName('inlineHelpBtn')
         self.app_help_btn.setCheckable(True)
         self.app_help_btn.setToolTip('Особенности Flatpak и программ со вспомогательными процессами')

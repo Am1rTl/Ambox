@@ -144,3 +144,12 @@ def test_app_explanation_is_collapsed_until_requested(ui, app):
     ui.app_help_btn.click()
     app.processEvents()
     assert ui.app_warning.isVisible()
+
+
+def test_dashboard_keeps_dark_background_in_tall_window(ui, app):
+    ui.resize(520, 690)
+    ui._set_bottom_page(0)
+    app.processEvents()
+    body = ui.overview_scroll.widget()
+    image = body.grab().toImage()
+    assert image.pixelColor(body.width() // 2, max(1, body.height() - 18)).lightness() < 70

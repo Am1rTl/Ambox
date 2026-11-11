@@ -165,7 +165,9 @@ QProgressBar#subscriptionProgress {
 }
 QProgressBar#subscriptionProgress::chunk { background: #37c7a9; border-radius: 3px; }
 QScrollArea { border: none; background: #0c121b; }
-QWidget#settingsBody, QWidget#subscriptionHost { background-color: #0c121b; }
+QWidget#settingsBody, QWidget#subscriptionHost, QWidget#overviewBody {
+    background-color: #0c121b;
+}
 QScrollArea#subscriptionScroll { background: #0c121b; }
 QScrollBar:vertical { width: 7px; background: #0c121b; margin: 3px 0; }
 QScrollBar:horizontal { height: 6px; background: #0c121b; margin: 0; }
