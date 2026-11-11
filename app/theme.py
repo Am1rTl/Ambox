@@ -124,6 +124,18 @@ QListWidget#applications::indicator {
 }
 QListWidget#applications::indicator:checked { background: #32c4aa; border: 1px solid #32c4aa; }
 QCheckBox { spacing: 7px; color: #cbd8e2; }
+QCheckBox#ruBypassToggle {
+    background-color: #152d35;
+    border: 1px solid #2f595a;
+    border-radius: 10px;
+    color: #d4f1ed;
+    padding: 9px 12px;
+    font-weight: 600;
+}
+QCheckBox#ruBypassToggle:hover {
+    border-color: #49a99a;
+    background-color: #193940;
+}
 QCheckBox::indicator { width: 18px; height: 18px; }
 QCheckBox::indicator:unchecked { background: #111a25; border: 1px solid #526879; border-radius: 5px; }
 QCheckBox::indicator:checked { background: #32c4aa; border: 1px solid #32c4aa; border-radius: 5px; }

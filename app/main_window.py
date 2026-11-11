@@ -348,6 +348,17 @@ class MainWindow(QMainWindow):
         self.connect_btn.clicked.connect(self.toggle_connection)
         connect_layout.addWidget(self.connect_btn)
 
+        # A global exception, intentionally on the main screen rather than
+        # hidden with expert routing options. One checkbox is the source of truth.
+        self.ignore_ru_domains_checkbox = QCheckBox("Сайты .ru — всегда напрямую")
+        self.ignore_ru_domains_checkbox.setObjectName("ruBypassToggle")
+        self.ignore_ru_domains_checkbox.setToolTip(
+            "Приоритетное исключение для всех режимов VPN, включая выбор приложений. "
+            "Применяется к соединениям, у которых можно определить домен. "
+            "Соединения по IP, DoH и скрытые имена могут не распознаваться."
+        )
+        connect_layout.addWidget(self.ignore_ru_domains_checkbox)
+
         self.install_card = QFrame()
         self.install_card.setObjectName("warningCard")
         install_layout = QVBoxLayout(self.install_card)
@@ -682,9 +693,6 @@ class MainWindow(QMainWindow):
         self.routing_mode_hint.setObjectName("softHint")
         settings_layout.addWidget(self.routing_mode_hint)
 
-        self.ignore_ru_domains_checkbox = QCheckBox("Bypass .ru domains")
-        settings_layout.addWidget(self.ignore_ru_domains_checkbox)
-
         self.routing_domains_frame = QFrame()
         self.routing_domains_frame.setObjectName("subCard")
         routing_layout = QVBoxLayout(self.routing_domains_frame)
@@ -744,7 +752,7 @@ class MainWindow(QMainWindow):
         leak_hint.setWordWrap(True)
         settings_layout.addWidget(leak_hint)
         self._advanced_widgets = [route_label, self.route_mode_combo,
-                                  self.routing_mode_hint, self.ignore_ru_domains_checkbox,
+                                  self.routing_mode_hint,
                                   self.routing_domains_frame, dns_label, self.dns_mode_combo,
                                   self.custom_dns_frame, self.auto_redirect_checkbox, leak_hint]
         settings_layout.addStretch(1)
@@ -1880,7 +1888,9 @@ class MainWindow(QMainWindow):
                 return
         mode, ignore_ru, domains = preset_values(key)
         self.route_mode_combo.setCurrentIndex(self.route_mode_combo.findData(mode))
-        self.ignore_ru_domains_checkbox.setChecked(ignore_ru)
+        # Other presets must not silently clear a user-enabled global exception.
+        if ignore_ru:
+            self.ignore_ru_domains_checkbox.setChecked(True)
         self.domains_edit.setPlainText(domains)
         self._append_log(f'Applied routing preset: {key}')
 

@@ -80,3 +80,23 @@ def test_application_screen_stays_within_narrow_window(ui, app):
     assert ui.application_list.height() >= 40
     for button in ui.app_mode_buttons.values():
         assert button.geometry().right() <= ui.width()
+
+
+def test_global_ru_bypass_is_visible_persistent_and_survives_presets(ui, app):
+    ui._set_bottom_page(0)
+    app.processEvents()
+    checkbox = ui.ignore_ru_domains_checkbox
+    assert checkbox.isVisible()
+    assert checkbox.isEnabled()
+    assert 'ru' in checkbox.text()
+    checkbox.setChecked(True)
+    assert ui.settings.value('route_ignore_ru_domains', False, type=bool)
+
+    # Changing presets must not silently turn off the global policy.
+    ui._set_bottom_page(6)
+    ui.preset_combo.setCurrentIndex(ui.preset_combo.findData('all'))
+    ui._apply_route_preset()
+    assert checkbox.isChecked()
+    ui._set_bottom_page(3)
+    ui.application_list.item(0).setCheckState(Qt.Checked)
+    assert ui._routing_options().ignore_ru_domains
