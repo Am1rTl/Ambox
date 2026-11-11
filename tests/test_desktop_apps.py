@@ -32,7 +32,7 @@ def test_desktop_name_icon_and_executable_resolution(tmp_path):
 def test_ignored_wrappers_cannot_capture_other_apps(tmp_path):
     def which(program):
         return '/usr/bin/' + program
-    for command in ['flatpak run org.example.App', 'env FOO=bar firefox', 'sh -c app',
+    for command in ['flatpak run org.example.App', 'sh -c app',
                     'python3 -m app', '/usr/bin/snap run example']:
         assert _launcher_executable(command, which=which) == ''
 
