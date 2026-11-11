@@ -51,6 +51,8 @@ def test_main_navigation_has_single_compact_footer(ui, app):
     assert ui.bottom_nav.height() == 44
     assert all(button.height() == 34 for button in [*ui.nav_buttons, ui.more_btn])
     assert all(not button.icon().isNull() for button in [*ui.nav_buttons, ui.more_btn])
+    assert ui.header_menu_btn.isVisible()
+    assert ui.header_menu_btn.menu() is not None
     assert ui.app_quick_btn.isVisible()
     ui._set_bottom_page(3)
     app.processEvents()
@@ -120,3 +122,25 @@ def test_compact_footer_never_clips_and_preserves_navigation(ui, app, width, hei
             assert button.height() == 34
             assert button.geometry().right() < ui.bottom_nav.width()
         assert ui.more_btn.isChecked() == (page not in (0, 1, 6))
+
+
+def test_empty_scroll_areas_use_dark_theme_and_no_horizontal_bar(ui, app):
+    ui.resize(380, 550)
+    ui._set_bottom_page(0)
+    app.processEvents()
+    assert not ui.overview_scroll.horizontalScrollBar().isVisible()
+    assert ui.vpn_status_card.height() < 85
+    ui._set_bottom_page(6)
+    app.processEvents()
+    host = ui.subscriptions_panel.card_host
+    image = host.grab().toImage()
+    assert image.pixelColor(host.width() // 2, max(1, host.height() - 20)).lightness() < 70
+
+
+def test_app_explanation_is_collapsed_until_requested(ui, app):
+    ui._set_bottom_page(3)
+    app.processEvents()
+    assert not ui.app_warning.isVisible()
+    ui.app_help_btn.click()
+    app.processEvents()
+    assert ui.app_warning.isVisible()

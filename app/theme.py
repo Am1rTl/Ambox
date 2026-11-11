@@ -16,6 +16,12 @@ QFrame#phoneShell, QStackedWidget#contentStack {
     background-color: #0c121b;
     border: none;
 }
+QPushButton#headerMenuBtn {
+    background: transparent; border: 1px solid transparent;
+    border-radius: 8px; padding: 3px; min-height: 0px;
+}
+QPushButton#headerMenuBtn:hover { background: #1d303d; border-color: #304f5a; }
+QPushButton#headerMenuBtn::menu-indicator { image: none; width: 0px; }
 QFrame#headerCard {
     background-color: #0c121b;
     border: none;
@@ -95,6 +101,12 @@ QPushButton#quickLink {
     padding: 4px 12px; min-height: 0px;
 }
 QPushButton#quickLink:hover { background: #1c303a; border-color: #397467; }
+QPushButton#inlineHelpBtn {
+    background: transparent; border: none; min-height: 0px;
+    font-size: 11px; text-align: left; color: #8aa9b6;
+    padding: 3px 0;
+}
+QPushButton#inlineHelpBtn:hover { color: #a6ebd5; }
 QLineEdit, QComboBox, QSpinBox, QTextEdit, QPlainTextEdit, QAbstractItemView {
     background-color: #121b26;
     color: #e4edf5;
@@ -152,8 +164,13 @@ QProgressBar#subscriptionProgress {
     border: none; border-radius: 3px; background-color: #293746;
 }
 QProgressBar#subscriptionProgress::chunk { background: #37c7a9; border-radius: 3px; }
-QScrollArea, QScrollArea QWidget#settingsBody { border: none; background: transparent; }
-QScrollBar:vertical { width: 7px; background: transparent; margin: 3px 0; }
+QScrollArea { border: none; background: #0c121b; }
+QWidget#settingsBody, QWidget#subscriptionHost { background-color: #0c121b; }
+QScrollArea#subscriptionScroll { background: #0c121b; }
+QScrollBar:vertical { width: 7px; background: #0c121b; margin: 3px 0; }
+QScrollBar:horizontal { height: 6px; background: #0c121b; margin: 0; }
+QScrollBar::handle:horizontal { background: #34465a; min-width: 24px; border-radius: 3px; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 QScrollBar::handle:vertical { background: #34465a; min-height: 25px; border-radius: 3px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QPlainTextEdit#logs { font-family: "DejaVu Sans Mono", monospace; font-size: 11px; padding: 8px; }

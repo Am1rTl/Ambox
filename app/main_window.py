@@ -301,9 +301,17 @@ class MainWindow(QMainWindow):
         title.setObjectName('panelTitle')
         header_layout.addWidget(title)
         header_layout.addStretch(1)
-        brand_caption = QLabel('VPN  ·  Linux')
+        brand_caption = QLabel('Linux')
         brand_caption.setObjectName('brandHint')
         header_layout.addWidget(brand_caption)
+        self.header_menu_btn = QPushButton('')
+        self.header_menu_btn.setObjectName('headerMenuBtn')
+        self.header_menu_btn.setIcon(navigation_icon('more'))
+        self.header_menu_btn.setIconSize(QSize(18, 18))
+        self.header_menu_btn.setFixedSize(32, 30)
+        self.header_menu_btn.setToolTip('Меню: импорт, подписки, диагностика')
+        self.header_menu_btn.setAccessibleName('Меню приложения')
+        header_layout.addWidget(self.header_menu_btn)
 
         phone_layout.addWidget(header)
 
@@ -318,6 +326,7 @@ class MainWindow(QMainWindow):
 
         self.vpn_status_card = QFrame()
         self.vpn_status_card.setObjectName("statusCard")
+        self.vpn_status_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         vpn_status_layout = QHBoxLayout(self.vpn_status_card)
         vpn_status_layout.setContentsMargins(12, 9, 12, 9)
         vpn_status_layout.setSpacing(8)
@@ -380,6 +389,7 @@ class MainWindow(QMainWindow):
 
         self.vpn_empty_frame = QFrame()
         self.vpn_empty_frame.setObjectName("subCard")
+        self.vpn_empty_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         vpn_empty_layout = QVBoxLayout(self.vpn_empty_frame)
         vpn_empty_layout.setContentsMargins(12, 12, 12, 12)
         vpn_empty_layout.setSpacing(8)
@@ -404,6 +414,7 @@ class MainWindow(QMainWindow):
 
         self.quick_profile_frame = QFrame()
         self.quick_profile_frame.setObjectName("quickProfileCard")
+        self.quick_profile_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         quick_profile_layout = QVBoxLayout(self.quick_profile_frame)
         quick_profile_layout.setContentsMargins(12, 10, 12, 10)
         quick_profile_layout.setSpacing(6)
@@ -442,6 +453,7 @@ class MainWindow(QMainWindow):
 
         self.traffic_card = QFrame()
         self.traffic_card.setObjectName('metricCard')
+        self.traffic_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         traffic_layout = QVBoxLayout(self.traffic_card)
         traffic_layout.setContentsMargins(12, 9, 12, 9)
         traffic_layout.setSpacing(5)
@@ -466,8 +478,13 @@ class MainWindow(QMainWindow):
         quality_row.addWidget(health_btn)
         traffic_layout.addLayout(quality_row)
         connect_layout.addWidget(self.traffic_card)
+        connect_layout.addStretch(1)  # keep cards compact in tall windows
         overview_scroll = QScrollArea()
+        overview_scroll.setObjectName('overviewScroll')
+        overview_scroll.setFrameShape(QFrame.NoFrame)
+        overview_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         overview_scroll.setWidgetResizable(True)
+        self.overview_scroll = overview_scroll
         overview_scroll.setFrameShape(QFrame.NoFrame)
         overview_scroll.setWidget(connect_tab)
         self.content_stack.addWidget(overview_scroll)
@@ -863,6 +880,13 @@ class MainWindow(QMainWindow):
         self.app_warning.setObjectName('softHint')
         self.app_warning.setWordWrap(True)
         hint_layout.addWidget(self.app_warning)
+        self.app_help_btn = QPushButton('ⓘ  Как определяется приложение?')
+        self.app_help_btn.setObjectName('inlineHelpBtn')
+        self.app_help_btn.setCheckable(True)
+        self.app_help_btn.setToolTip('Особенности Flatpak и программ со вспомогательными процессами')
+        self.app_help_btn.toggled.connect(hint_card.setVisible)
+        applications_layout.addWidget(self.app_help_btn)
+        hint_card.hide()
         applications_layout.addWidget(hint_card)
 
         self._refresh_application_list()
@@ -1629,7 +1653,9 @@ class MainWindow(QMainWindow):
         self._set_selected_profile_index(combo_index)
 
     def _build_menu(self) -> None:
-        menu = self.menuBar().addMenu("File")
+        root_menu = QMenu(self.header_menu_btn)
+        self.header_menu_btn.setMenu(root_menu)
+        menu = root_menu.addMenu('Файл')
 
         import_action = QAction("Import from file", self)
         import_action.triggered.connect(self.import_config)
@@ -1664,7 +1690,7 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(self.close)
         menu.addAction(quit_action)
 
-        sub_menu = self.menuBar().addMenu("Subscriptions")
+        sub_menu = root_menu.addMenu('Подписки')
 
         update_subs_action = QAction("Update all subscriptions", self)
         update_subs_action.setShortcut(QKeySequence("Ctrl+U"))
@@ -1678,6 +1704,9 @@ class MainWindow(QMainWindow):
         add_sub_action = QAction("Add subscription...", self)
         add_sub_action.triggered.connect(self.add_subscription_dialog)
         sub_menu.addAction(add_sub_action)
+        # Keep shortcuts available even when the header popup is closed.
+        for action in (import_clip_action, ping_action, diag_action, logs_action, update_subs_action):
+            self.addAction(action)
 
     def _connect_signals(self) -> None:
         self.vpn.status_changed.connect(self._on_vpn_status_changed)
