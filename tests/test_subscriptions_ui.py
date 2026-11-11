@@ -10,7 +10,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 
-from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
+from PySide6.QtWidgets import QApplication, QDialog, QWidget  # noqa: E402
 
 from app.subscriptions import Subscription  # noqa: E402
 from app.subscriptions_dialog import (  # noqa: E402
@@ -94,6 +94,6 @@ def test_add_subscription_dialog_rejects_config_links(app):
     assert dialog.error.isHidden() is False
     dialog.url_edit.setText("https://example.org/sub?token=secret")
     dialog._validate()
-    assert dialog.result() == dialog.Accepted
+    assert dialog.result() == QDialog.DialogCode.Accepted
     dialog.close()
     parent.close()
