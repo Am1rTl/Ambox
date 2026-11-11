@@ -10,6 +10,7 @@ from typing import Any, Callable
 from urllib.parse import unquote, urlparse
 
 from app.app_paths import ensure_user_owned, subscriptions_path
+from app.security import atomic_private_json
 from app.config_parser import ConfigError, Profile, load_profiles_from_text
 from app.happ_links import (
     HappLinkError,
@@ -292,17 +293,16 @@ class SubscriptionStore:
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"subscriptions": [sub.to_dict() for sub in self.subscriptions.values()]}
-        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        ensure_user_owned(tmp_path)
         if self.path.exists():
-            backup_path = self.path.with_suffix(self.path.suffix + ".bak")
+            backup_path = self.path.with_suffix(self.path.suffix + '.bak')
             try:
                 shutil.copy2(self.path, backup_path)
                 ensure_user_owned(backup_path)
+                if backup_path.exists():
+                    backup_path.chmod(0o600)
             except OSError:
                 pass
-        tmp_path.replace(self.path)
+        atomic_private_json(self.path, payload)
         ensure_user_owned(self.path)
 
     def get(self, sub_id: str) -> Subscription | None:
@@ -319,3 +319,9 @@ class SubscriptionStore:
         if sub_id in self.subscriptions:
             del self.subscriptions[sub_id]
             self.save()
+
+
+def subscription_due(sub: Subscription, now: float, interval_hours: int = 12) -> bool:
+    """Automatic updates honor each subscription's opt-in and an interval."""
+    return bool(sub.auto_update and (sub.updated_at <= 0 or
+                  now - sub.updated_at >= max(1, interval_hours) * 3600))

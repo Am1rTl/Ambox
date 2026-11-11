@@ -5,6 +5,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 from ipaddress import ip_address
 from pathlib import Path
@@ -13,15 +14,15 @@ from urllib.parse import urlparse
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 
 from app.app_paths import active_config_path, ensure_user_owned, singbox_cache_path
+from app.security import atomic_private_json, redact
 from app.config_parser import Profile, RoutingOptions, build_singbox_config
 from app.latency import find_unavailable_nodes
 from app.xray_bundle import ensure_rule_sets, required_rule_sets
 from app import net_session
 
-# Advisory floor: generated configs use binary rule-sets and
-# route.auto_detect_interface, which need a 2024+ sing-box. The check only
-# warns (never blocks connecting) so an off-by release is harmless.
-MIN_SINGBOX_VERSION = (1, 8, 0)
+# Generated configs use DNS `local` introduced in sing-box 1.12.0.
+# Versions below this floor are rejected *before* stopping a working tunnel.
+MIN_SINGBOX_VERSION = (1, 12, 0)
 
 
 def parse_singbox_version(output: str) -> tuple[int, int, int] | None:
@@ -41,7 +42,9 @@ class VpnManager(QObject):
     error = Signal(str)
     singbox_availability_changed = Signal(bool)
     install_state_changed = Signal(bool)
-    _prepared = Signal(int, object, str)
+    _prepared = Signal(int, object, str, object)
+    profile_starting = Signal(object)
+    connection_lost = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -63,6 +66,11 @@ class VpnManager(QObject):
         self._pending_warning = net_session.reconcile_stale_session()
         self._connect_generation = 0
         self._pending_connect: tuple[Profile, RoutingOptions | None] | None = None
+        self._pending_validated: tuple[dict, str, Profile] | None = None
+        self._preparing_switch: int | None = None
+        self._intentional_stop = False
+        self._active_session: tuple[dict, str, Profile] | None = None
+        self._rollback_session: tuple[dict, str, Profile] | None = None
         self._singbox_version: tuple[int, int, int] | None = None
         self._version_checked = False
         self._prepared.connect(self._on_prepared)
@@ -307,22 +315,54 @@ class VpnManager(QObject):
         return self._singbox_version
 
     def singbox_has_net_admin(self) -> bool | None:
-        """True/False when verifiable, None when unknown (missing binary/setcap or check failed)."""
+        """Inspect actual file capabilities using getcap (setcap -v is not a query)."""
         singbox = self._resolve_singbox()
-        setcap_path = shutil.which("setcap")
-        if not singbox or not setcap_path:
+        if not singbox:
+            return None
+        if hasattr(os, 'geteuid') and os.geteuid() == 0:
+            return True
+        getcap_path = shutil.which('getcap')
+        if not getcap_path:
             return None
         try:
-            cap_result = subprocess.run(
-                [setcap_path, "-v", singbox],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        except OSError:
+            result = subprocess.run([getcap_path, singbox], capture_output=True,
+                                    text=True, timeout=4, check=False)
+        except (OSError, subprocess.TimeoutExpired):
             return None
-        cap_text = (cap_result.stdout + cap_result.stderr).lower()
-        return cap_result.returncode == 0 or "cap_net_admin" in cap_text
+        if result.returncode != 0:
+            return None
+        output = (result.stdout + result.stderr).lower()
+        # `cap_net_admin=ep`, `cap_net_admin+ep`, possibly combined with other caps.
+        return bool(re.search(r'\bcap_net_admin\b[^\n]*[=+]\s*(?:[a-z,]*e[a-z,]*p|[a-z,]*p[a-z,]*e)', output))
+
+    def validate_config(self, singbox: str, config: dict) -> None:
+        """Validate the real generated JSON before changing the current tunnel."""
+        tmp_name = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.json',
+                                             prefix='.ambox-check-',
+                                             dir=str(self._temp_config.parent),
+                                             delete=False) as temp:
+                tmp_name = temp.name
+                if os.name == 'posix':
+                    os.fchmod(temp.fileno(), 0o600)
+                json.dump(config, temp, ensure_ascii=False)
+            result = subprocess.run([singbox, 'check', '-c', tmp_name],
+                                    capture_output=True, text=True, timeout=20,
+                                    check=False)
+            if result.returncode != 0:
+                detail = redact((result.stderr or result.stdout or 'unknown error').strip())[-1500:]
+                raise ValueError(f'sing-box rejected the generated configuration: {detail}')
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError('sing-box configuration check timed out (20 s).') from exc
+        except OSError as exc:
+            raise ValueError(f'Cannot validate sing-box config: {exc}') from exc
+        finally:
+            if tmp_name:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
 
     def environment_warnings(self) -> list[str]:
         warnings: list[str] = []
@@ -342,18 +382,15 @@ class VpnManager(QObject):
             warnings.append("The `ip` command is missing. Interface checks may be incomplete.")
         if shutil.which("pgrep") is None:
             warnings.append("The `pgrep` command is missing. External sing-box conflict checks may be incomplete.")
-        setcap_path = shutil.which("setcap")
-        if singbox and setcap_path is None:
-            warnings.append("The `setcap` command is missing. TUN permission setup may require manual steps.")
-        elif singbox and setcap_path is not None:
+        if singbox:
             has_cap = self.singbox_has_net_admin()
             if has_cap is False:
                 warnings.append(
-                    "sing-box may not have CAP_NET_ADMIN. If TUN setup fails, run: "
+                    "sing-box does not have CAP_NET_ADMIN. If TUN setup fails, run: "
                     'sudo setcap cap_net_admin+ep "$(command -v sing-box)"'
                 )
             elif has_cap is None:
-                warnings.append("Failed to verify sing-box capabilities. TUN permission issues may require manual setup.")
+                warnings.append("Cannot verify sing-box capabilities; install `getcap` (libcap2-bin) to inspect TUN permissions.")
         return warnings
 
     def refresh_singbox_availability(self) -> None:
@@ -423,100 +460,133 @@ class VpnManager(QObject):
             return
 
     def connect_profile(self, profile: Profile, routing: RoutingOptions | None = None) -> None:
-        if (
-            self.process.state() != QProcess.NotRunning
-            or self._status in {"connecting", "disconnecting"}
-        ):
-            # Profile switch or auto-switch while a session is active: stop the
-            # current session first, then start the new one from _on_finished.
-            # Never blocks the GUI thread.
+        if self._status == 'disconnecting':
             self._pending_connect = (profile, routing)
-            self.log_line.emit(f"Switching to profile: {profile.name} (stopping current session...)")
-            self.request_disconnect(cancel_pending=False)
             return
-        self._pending_connect = None
-
-        conflict = self._detect_external_conflict()
-        if conflict:
-            self.error.emit(conflict)
-            return
-
         singbox = self._resolve_singbox()
         if not singbox:
-            self.error.emit("sing-box not found. Click 'Install sing-box'.")
+            self.error.emit('sing-box not found. Click "Install sing-box".')
             self.refresh_singbox_availability()
             return
         version = self.singbox_version()
-        if version is not None:
-            self.log_line.emit(f"sing-box version: {'.'.join(map(str, version))}")
-
+        if version is not None and version < MIN_SINGBOX_VERSION:
+            minimum = '.'.join(map(str, MIN_SINGBOX_VERSION))
+            self.error.emit(f'sing-box {version[0]}.{version[1]}.{version[2]} is too old; {minimum}+ is required.')
+            return
+        busy = self.process.state() != QProcess.NotRunning
+        if not busy and self._status != 'connecting':
+            conflict = self._detect_external_conflict()
+            if conflict:
+                self.error.emit(conflict)
+                return
         self._connect_generation += 1
-        self._set_status("connecting")
-        self.log_line.emit(f"Starting profile: {profile.name}")
-        # DNS checks, rule-set downloads and node probes take seconds; keep them off the GUI thread.
-        threading.Thread(
-            target=self._prepare_worker,
-            args=(self._connect_generation, profile, routing, singbox),
-            daemon=True,
-        ).start()
+        generation = self._connect_generation
+        self._pending_validated = None
+        if busy:
+            # Keep the original tunnel alive while the replacement is fetched,
+            # generated and validated; old connection is untouched on error.
+            self._pending_connect = (profile, routing)
+            self._preparing_switch = generation
+            self.log_line.emit(f'Preflight for {profile.name} (existing VPN stays connected)...')
+        else:
+            self._pending_connect = None
+            self._preparing_switch = None
+            self._set_status('connecting')
+            self.log_line.emit(f'Preparing profile: {profile.name}')
+        threading.Thread(target=self._prepare_worker,
+                         args=(generation, profile, routing, singbox), daemon=True).start()
 
-    def _prepare_worker(self, generation: int, profile: Profile, routing: RoutingOptions | None, singbox: str) -> None:
+    def _prepare_worker(self, generation: int, profile: Profile,
+                        routing: RoutingOptions | None, singbox: str) -> None:
         try:
-            if routing and routing.dns_mode == "custom":
-                routing.custom_dns = self._prepare_custom_dns(routing.custom_dns)
-                self.log_line.emit(f"Custom DNS ready: {routing.custom_dns}")
-
+            # Do not mutate persisted routing options in a background thread.
+            if routing and routing.dns_mode == 'custom':
+                from dataclasses import replace
+                dns = self._prepare_custom_dns(routing.custom_dns)
+                routing = replace(routing, custom_dns=dns)
+                self.log_line.emit('Custom DNS preflight passed')
             unavailable: set[str] = set()
             if profile.xray:
-                # Rule-sets must be on disk before sing-box starts; stale/missing ones are refreshed here.
                 ensure_rule_sets(required_rule_sets(profile.xray))
                 unavailable = find_unavailable_nodes(profile.xray)
             cfg = build_singbox_config(profile.outbound, routing, xray=profile.xray, unavailable=unavailable)
             if profile.xray:
-                nodes = [ob for ob in cfg["outbounds"] if ob.get("type") not in {"direct", "block", "urltest"}]
-                groups = sum(1 for ob in cfg["outbounds"] if ob.get("type") == "urltest")
+                nodes = [ob for ob in cfg['outbounds'] if ob.get('type') not in {'direct', 'block', 'urltest'}]
+                groups = sum(1 for ob in cfg['outbounds'] if ob.get('type') == 'urltest')
                 self.log_line.emit(
-                    f"Happ config: {len(nodes)} reachable node(s) ({len(unavailable)} unreachable skipped), "
-                    f"{groups} balancer group(s), {len(cfg['route'].get('rule_set', []))} rule-set(s)"
+                    f'Happ config: {len(nodes)} reachable node(s), '
+                    f'{len(unavailable)} skipped, {groups} balancer(s)'
                 )
-                main_tag = profile.outbound.get("tag")
-                if not any(ob.get("tag") == main_tag for ob in nodes):
-                    self.log_line.emit(
-                        "Main server of this location does not answer from your network; "
-                        "traffic goes through the subscription's backup servers."
-                    )
+            self.validate_config(singbox, cfg)
         except Exception as exc:
-            self._prepared.emit(generation, None, str(exc))
+            self._prepared.emit(generation, None, redact(str(exc)), profile)
             return
-        self._prepared.emit(generation, cfg, singbox)
+        self._prepared.emit(generation, cfg, singbox, profile)
 
-    def _on_prepared(self, generation: int, cfg: object, info: str) -> None:
-        if generation != self._connect_generation or self._status != "connecting":
-            return  # cancelled or superseded while preparing
+    def _on_prepared(self, generation: int, cfg: object, info: str, profile: Profile) -> None:
+        if generation != self._connect_generation:
+            return  # superseded or cancelled during preparation
+        switching = generation == self._preparing_switch
         if not isinstance(cfg, dict):
-            self._set_status("disconnected")
-            self.error.emit(info or "failed to prepare VPN config")
+            if switching:
+                self._preparing_switch = None
+                self._pending_connect = None
+                self.error.emit(f'Profile switch cancelled; existing VPN unchanged. {info}')
+            elif self._status == 'connecting':
+                self._set_status('disconnected')
+                self.error.emit(info or 'Failed to prepare VPN configuration')
+                self.connection_lost.emit('VPN preflight failed')
             return
-        singbox = info
-        self._temp_config.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-        ensure_user_owned(self._temp_config)
+        if switching and self.process.state() != QProcess.NotRunning:
+            self._preparing_switch = None
+            self._rollback_session = self._active_session if self._status == 'connected' else None
+            self._pending_validated = (cfg, info, profile)
+            self.log_line.emit('New configuration checked. Switching VPN session...')
+            self.request_disconnect(cancel_pending=False)
+            return
+        if self._status not in {'connecting', 'connected'}:
+            return
+        self._preparing_switch = None
+        self._pending_connect = None
+        self._set_status('connecting')
+        self._launch_prepared(cfg, info, profile)
 
-        self._fatal_reported = False
-        self._begin_session()
-        self.log_line.emit(f"Using sing-box: {singbox}")
-        program, args = singbox, ["run", "-c", str(self._temp_config)]
-        setpriv = shutil.which("setpriv")
+    def _launch_prepared(self, cfg: dict, singbox: str, profile: Profile) -> None:
+        try:
+            atomic_private_json(self._temp_config, cfg)
+            ensure_user_owned(self._temp_config)
+            self._fatal_reported = False
+            self._begin_session()
+        except OSError as exc:
+            self._set_status('disconnected')
+            self.error.emit(f'Could not prepare VPN session: {exc}')
+            self._try_rollback()
+            return
+        self.log_line.emit(f'Using sing-box: {singbox}')
+        program, args = singbox, ['run', '-c', str(self._temp_config)]
+        setpriv = shutil.which('setpriv')
         if setpriv:
-            # If the GUI is SIGKILLed, the kernel sends SIGTERM to sing-box so it tears down its TUN.
-            # setpriv execs sing-box, so PID / starttime / cmdline in the journal stay sing-box's.
-            program, args = setpriv, ["--pdeathsig", "TERM", "--", singbox, *args]
+            program, args = setpriv, ['--pdeathsig', 'TERM', '--', singbox, *args]
+        self._intentional_stop = False
         self.process.start(program, args)
         if not self.process.waitForStarted(4000):
-            self._set_status("disconnected")
+            self._set_status('disconnected')
             self._end_session()
-            self.error.emit("failed to start sing-box")
+            self.error.emit('Failed to start sing-box')
+            self._try_rollback()
             return
+        self._active_session = (cfg, singbox, profile)
         self._record_singbox_pid()
+        self.profile_starting.emit(profile)
+
+    def _try_rollback(self) -> bool:
+        rollback, self._rollback_session = self._rollback_session, None
+        if rollback is None:
+            return False
+        self.log_line.emit('New VPN failed to start. Attempting to restore the previous configuration...')
+        self._set_status('connecting')
+        self._launch_prepared(*rollback)
+        return True
 
     def request_disconnect(self, cancel_pending: bool = True) -> None:
         """Stop the VPN without blocking the GUI thread.
@@ -529,6 +599,10 @@ class VpnManager(QObject):
         generation = self._connect_generation
         if cancel_pending:
             self._pending_connect = None
+            self._pending_validated = None
+            self._preparing_switch = None
+            self._rollback_session = None
+        self._intentional_stop = True
         if self.process.state() == QProcess.NotRunning:
             self._end_session()
             self._set_status("disconnected")
@@ -549,11 +623,16 @@ class VpnManager(QObject):
         self.process.kill()
 
     def _start_pending_connect(self) -> None:
-        pending, self._pending_connect = self._pending_connect, None
-        if pending is None or self._status != "disconnected":
+        prepared, self._pending_validated = self._pending_validated, None
+        if prepared is not None and self._status == 'disconnected':
+            self._pending_connect = None
+            self._set_status('connecting')
+            self._launch_prepared(*prepared)
             return
-        profile, routing = pending
-        self.connect_profile(profile, routing)
+        pending, self._pending_connect = self._pending_connect, None
+        if pending is not None and self._status == 'disconnected':
+            profile, routing = pending
+            self.connect_profile(profile, routing)
 
     def disconnect(self) -> None:
         """Synchronous stop for application shutdown (closeEvent/aboutToQuit).
@@ -563,6 +642,10 @@ class VpnManager(QObject):
         """
         self._connect_generation += 1
         self._pending_connect = None
+        self._pending_validated = None
+        self._preparing_switch = None
+        self._rollback_session = None
+        self._intentional_stop = True
         if self.process.state() == QProcess.NotRunning:
             self._end_session()
             self._set_status("disconnected")
@@ -584,6 +667,7 @@ class VpnManager(QObject):
         for line in output.splitlines():
             self.log_line.emit(line)
             if self._status == "connecting" and "sing-box started" in line.lower():
+                self._rollback_session = None
                 self._set_status("connected")
 
     def _read_stderr(self) -> None:
@@ -591,6 +675,7 @@ class VpnManager(QObject):
         for line in output.splitlines():
             self.log_line.emit(line)
             if self._status == "connecting" and "sing-box started" in line.lower():
+                self._rollback_session = None
                 self._set_status("connected")
             if not self._fatal_reported and "FATAL" in line:
                 self._fatal_reported = True
@@ -610,12 +695,20 @@ class VpnManager(QObject):
                     self.error.emit("sing-box failed to start. Check detailed logs below.")
 
     def _on_finished(self) -> None:
+        unexpected = not self._intentional_stop and self._pending_validated is None
+        was_starting = self._status == 'connecting'
         self._end_session()
-        if self._status != "disconnected":
-            self._set_status("disconnected")
+        if unexpected and was_starting and self._try_rollback():
+            return
+        if unexpected:
+            self._rollback_session = None
+        if self._status != 'disconnected':
+            self._set_status('disconnected')
             ensure_user_owned(singbox_cache_path())
-            self.log_line.emit("sing-box process exited")
+            self.log_line.emit('sing-box process exited')
         self._start_pending_connect()
+        if unexpected:
+            self.connection_lost.emit('sing-box exited unexpectedly')
 
     def _read_install_stdout(self) -> None:
         output = self._strip_ansi(
