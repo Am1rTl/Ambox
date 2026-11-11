@@ -45,7 +45,7 @@ def ui(app, monkeypatch, tmp_path):
 
 
 def test_main_navigation_has_single_compact_footer(ui, app):
-    assert ui.width() == 520
+    assert ui.width() == 510
     assert len(ui.nav_buttons) == 3
     assert ui.bottom_nav.isVisible()
     assert ui.bottom_nav.height() == 44

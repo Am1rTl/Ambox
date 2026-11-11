@@ -58,7 +58,7 @@ def render(output: Path) -> None:
             window._sync_quick_profile_selector()
             window.subscriptions_panel.refresh_list()
             pages = {'vpn': 0, 'configs': 1, 'subscriptions': 6, 'apps': 3}
-            for size in ((380, 550), (520, 690), (720, 780)):
+            for size in ((380, 550), (510, 610), (520, 690), (720, 780)):
                 window.resize(*size)
                 window.show()
                 app.processEvents()

@@ -161,7 +161,7 @@ class MainWindow(QMainWindow):
     def __init__(self, initial_link: str | None = None) -> None:
         super().__init__()
         self.setWindowTitle("ambox")
-        self.resize(520, 690)
+        self.resize(510, 610)
         self.setMinimumSize(380, 550)
         self._app_icon = self._build_app_icon()
         self.setWindowIcon(self._app_icon)

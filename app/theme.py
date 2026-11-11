@@ -87,6 +87,7 @@ QPushButton#navBtn {
     font-size: 11px; font-weight: 650;
     padding: 3px 4px; min-height: 0px;
 }
+QPushButton#navBtn::menu-indicator { image: none; width: 0px; }
 QPushButton#navBtn:hover { background: #253846; color: #e8f7f2; }
 QPushButton#navBtn:checked { background: #205046; color: #b1ffe8; }
 QFrame#bottomNav {
